@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pipeline import (STORAGE, VideoIndex, search_embeddings,
                       frames_to_segments, parse_query, index_video, extract_clip)
+from search_engine import search as enhanced_search, suggest as query_suggest
+from benchmark import benchmark
 
 executor = ThreadPoolExecutor(4)
 _indexes: dict[str, VideoIndex] = {}
@@ -177,6 +179,76 @@ def metrics():
     total_frames = sum(len(idx.frame_indices) for idx in _indexes.values())
     return {"videos_indexed": len(_indexes), "total_keyframes": total_frames,
             "videos": list(_indexes.keys())}
+
+# ---- Enhanced endpoints ----
+
+class V2SearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    enable_detection: bool = True
+
+@app.post("/api/v2/search")
+async def search_v2(req: V2SearchRequest):
+    if not _indexes:
+        return JSONResponse(status_code=400, content={"detail": "No videos indexed.", "segments": []})
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor, enhanced_search, req.query, _indexes, req.top_k, req.enable_detection
+    )
+    return result
+
+@app.get("/api/videos/{video_id}/timeline")
+def get_timeline(video_id: str):
+    idx = _indexes.get(video_id)
+    if not idx:
+        raise HTTPException(404, "Video not indexed")
+    events = []
+    for i, (fi, ts, ms) in enumerate(zip(idx.frame_indices, idx.timestamps, idx.motion_scores)):
+        events.append({
+            "frame_index": fi,
+            "timestamp": round(ts, 2),
+            "motion_score": round(ms, 4),
+            "has_thumbnail": (STORAGE / "frames" / video_id / f"frame_{fi}.jpg").exists()
+        })
+    return {
+        "video_id": video_id,
+        "metadata": idx.metadata,
+        "total_keyframes": len(idx.frame_indices),
+        "events": events
+    }
+
+@app.get("/api/videos/{video_id}/objects")
+def get_video_objects(video_id: str):
+    idx = _indexes.get(video_id)
+    if not idx:
+        raise HTTPException(404, "Video not indexed")
+    frames_dir = STORAGE / "frames" / video_id
+    detected = []
+    for fi in idx.frame_indices[:50]:
+        annotated_path = frames_dir / f"frame_{fi}_d.jpg"
+        if annotated_path.exists():
+            detected.append({
+                "frame_index": fi,
+                "timestamp": round(idx.timestamps[idx.frame_indices.index(fi)], 2) if fi in idx.frame_indices else 0,
+                "annotated": f"/api/frames/{video_id}/frame_{fi}_d.jpg"
+            })
+    return {"video_id": video_id, "detected_frames": detected}
+
+@app.get("/api/dashboard/metrics")
+def dashboard_metrics():
+    b = benchmark.stats()
+    b["indexed_videos"] = len(_indexes)
+    b["videos"] = list(_indexes.keys())
+    b["total_frames_motion"] = sum(len(idx.frame_indices) for idx in _indexes.values())
+    if _indexes:
+        vid = list(_indexes.values())[0]
+        b["gpu_available"] = __import__("torch").cuda.is_available()
+    return b
+
+@app.post("/api/search/suggest")
+def search_suggest(req: SearchRequest):
+    suggestions = query_suggest(req.query)
+    return {"query": req.query, "suggestions": suggestions}
 
 if __name__ == "__main__":
     import uvicorn

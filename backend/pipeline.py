@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from benchmark import benchmark as bm
 
 STORAGE = Path(__file__).parent / "storage"
 for _d in ["originals", "frames", "clips", "reports"]:
@@ -21,6 +22,8 @@ class VideoIndex:
     embeddings: list[list[float]] = field(default_factory=list)
     motion_scores: list[float] = field(default_factory=list)
     total_frames: int = 0
+    metadata: dict = field(default_factory=lambda: {"fps": 0, "width": 0, "height": 0, "duration": 0})
+    benchmarks: dict = field(default_factory=lambda: {"scan_time": 0, "extract_time": 0, "embed_time": 0, "total_time": 0})
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 from transformers import CLIPModel, CLIPProcessor
@@ -206,6 +209,13 @@ def extract_clip(video_path: str, start_time: float, end_time: float, output: st
 
 def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoIndex:
     t0 = time.time()
+    # Capture metadata
+    cap_info = cv2.VideoCapture(video_path)
+    fps = cap_info.get(cv2.CAP_PROP_FPS)
+    width = int(cap_info.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap_info.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap_info.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap_info.release()
     if progress is not None:
         progress["_t0"] = t0
         progress["stage"] = "motion_scan"
@@ -228,7 +238,10 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     embs = compute_embeddings(frames, progress=progress)
     t3 = time.time()
     idx = VideoIndex(video_id=video_id, frame_indices=keep_frames, timestamps=timestamps,
-                     embeddings=embs.tolist(), motion_scores=motion_scores, total_frames=total)
+                     embeddings=embs.tolist(), motion_scores=motion_scores, total_frames=total,
+                     metadata={"fps": round(fps, 2), "width": width, "height": height, "duration": round(total / max(fps, 1), 2)},
+                     benchmarks={"scan_time": round(t1 - t0, 2), "extract_time": round(t2 - t1, 2),
+                                 "embed_time": round(t3 - t2, 2), "total_time": round(t3 - t0, 2)})
     out_dir = STORAGE / "frames" / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
     if progress is not None:
@@ -248,6 +261,7 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["message"] = "Complete"
         progress["keyframes"] = len(keep_frames)
         progress["total_frames"] = total
+    bm.record_index(t1 - t0, t2 - t1, t3 - t2, t3 - t0, total, len(keep_frames))
     print(f"  Times: scan={t1-t0:.1f}s, extract={t2-t1:.1f}s, embed={t3-t2:.1f}s, total={t3-t0:.1f}s")
     print(f"Indexed {video_id}: {len(keep_frames)} keyframes from {total} total frames")
     return idx

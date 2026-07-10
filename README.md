@@ -11,6 +11,7 @@
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)](https://react.dev)
 [![CLIP](https://img.shields.io/badge/CLIP-ViT--B/32-FF6F00?logo=openai&logoColor=white)](https://openai.com/research/clip)
 [![FAISS](https://img.shields.io/badge/FAISS-IVFFlat-512BD4?logo=meta&logoColor=white)](https://faiss.ai)
+[![Grounding DINO](https://img.shields.io/badge/GroundingDINO-ZeroShot-22c55e?logo=huggingface&logoColor=white)](https://huggingface.co/IDEA-Research/grounding-dino-base)
 [![GPU](https://img.shields.io/badge/GPU-CUDA-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda)
 
 **Upload a video. Type a sentence. Get the clip.** — All on-device, no cloud API, ~5s query time.
@@ -46,13 +47,27 @@ Open **http://localhost:5173** → Upload `.mp4` → Type any query → Get resu
 ## 🧠 How It Works
 
 ```
-                INDEXING                                  SEARCH
-┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐
-│  Upload  │──▶│  Motion      │──▶│  CLIP    │──▶│  FAISS   │──▶│  Segment     │
-│  Video   │   │  Sampling    │   │  Embed   │   │  Search  │   │  Clustering  │
-│          │   │  (160×90,    │   │  (GPU    │   │  (IVF    │   │  + Confidence│
-│          │   │   stride=3)  │   │  batch32)│   │  FlatIP) │   │  Gating      │
-└──────────┘   └──────────────┘   └──────────┘   └──────────┘   └──────────────┘
+                    INDEXING                           ENHANCED SEARCH
+┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌────────────┐   ┌────────────────┐
+│  Upload  │──▶│  Motion      │──▶│  CLIP    │──▶│  FAISS     │──▶│  Zero-Shot     │
+│  Video   │   │  Sampling    │   │  Embed   │   │  Search    │   │  Detection     │
+│          │   │  (160×90,    │   │  (GPU    │   │  (IVF      │   │  (Grounding    │
+│          │   │   stride=3)  │   │  batch32)│   │  FlatIP)   │   │   DINO)        │
+└──────────┘   └──────┬───────┘   └──────────┘   └─────┬──────┘   └───────┬────────┘
+                      │                                 │                 │
+                      ▼                                 ▼                 ▼
+               ┌────────────┐                    ┌──────────┐     ┌──────────────┐
+               │ Background │                    │ Weighted │     │  Bounding    │
+               │ ThreadPool │                    │ Scoring  │◀────│  Boxes +     │
+               │ Executor   │                    │ (CLIP +  │     │  Labels      │
+               └────────────┘                    │ Object)  │     └──────────────┘
+                                                 └─────┬────┘
+                                                       ▼
+                                               ┌──────────────┐
+                                               │  Explanation │
+                                               │  + Timeline  │
+                                               │  + Dashboard │
+                                               └──────────────┘
 ```
 
 ### 1️⃣ Motion-Guided Sampling
@@ -65,9 +80,16 @@ Each keyframe → 512-dim vector via `openai/clip-vit-base-patch32`. The user's 
 Milliseconds to search. IVFFlat for large indexes, FlatIP fallback for small ones. Results clustered into coherent segments by frame-index proximity.
 
 ### ⏳ Live Progress Tracking
-Indexing runs **asynchronously in a background thread** — the UI polls `GET /api/videos/{id}/index-progress` every 800ms and displays a real-time progress bar with **stage name** (motion scan → extract → embed → save), **percentage**, and **ETA**. No more staring at a spinner.
+Indexing runs **asynchronously in a background thread** — the UI polls `GET /api/videos/{id}/index-progress` every 800ms and displays a real-time progress bar with **stage name** (motion scan → extract → embed → save), **percentage**, and **ETA**.
 
-### 5️⃣ Confidence Gating
+### 4️⃣ Zero-Shot Object Detection
+After retrieving candidate frames, **Grounding DINO** runs open-vocabulary detection on the middle frame of each segment. Detects arbitrary objects described in the query — *"backpack"*, *"red car"*, *"helmet"* — without any training. Bounding boxes rendered on thumbnails.
+
+### 5️⃣ Weighted Scoring + Explanation
+**Overall Score = 55% Semantic Similarity + 45% Object Match**
+Every result shows a score breakdown: semantic match, object match, tracking consistency, and temporal alignment. An **Explanation Panel** tells the user *why* each clip matched.
+
+### 6️⃣ Confidence Gating
 | Level | Threshold | Behavior |
 |-------|-----------|----------|
 | 🟢 HIGH | > 0.25 | Strong semantic match |
@@ -97,10 +119,11 @@ Indexing runs **asynchronously in a background thread** — the UI polls `GET /a
 | Layer | Technology | Why |
 |-------|-----------|-----|
 | **Vision-Language** | CLIP ViT-B/32 | Zero-shot semantic understanding |
+| **Open-Vocab Detection** | Grounding DINO | Detect any object from query text |
 | **Motion Analysis** | OpenCV Farneback (160×90) | 200+ FPS flow computation |
 | **Vector Search** | FAISS (IVFFlat) | O(log n) at 100K+ vectors |
-| **Backend** | FastAPI + ThreadPoolExecutor | Async endpoints, CPU offload |
-| **Frontend** | React 18 + Vite + Tailwind | Real-time progress bar, segment cards |
+| **Backend** | FastAPI + ThreadPoolExecutor | Async endpoints, CPU offload, metrics |
+| **Frontend** | React 18 + Vite + Tailwind | Google-like search, dashboard, timeline |
 | **Storage** | Local filesystem (JSON) | Index persistence across restarts |
 
 ---
@@ -114,10 +137,15 @@ Indexing runs **asynchronously in a background thread** — the UI polls `GET /a
 | `POST` | `/api/videos/{id}/index` | ⚙️ Index with live progress tracking |
 | `GET` | `/api/videos/{id}/index-progress` | 📊 Pollable progress % + ETA + stage |
 | `GET` | `/api/videos/{id}/status` | ✅ Index readiness + keyframe count |
-| `POST` | `/api/search` | 🔍 Semantic search by natural language |
+| `POST` | `/api/search` | 🔍 Original semantic search (backward compat) |
+| `POST` | `/api/v2/search` | 🚀 Enhanced search with detection + weighted scoring + score breakdown |
+| `GET` | `/api/videos/{id}/timeline` | ⏳ Event timeline with motion scores per frame |
+| `GET` | `/api/videos/{id}/objects` | 🔲 Detected objects with annotated thumbnails |
+| `POST` | `/api/search/suggest` | 💡 Query autocomplete suggestions |
+| `GET` | `/api/dashboard/metrics` | 📊 Full performance dashboard (speed, latency, GPU, reduction) |
 | `GET` | `/api/clips/{id}` | 🎞️ Download extracted MP4 clip |
 | `GET` | `/api/reports/{id}` | 📈 Frame reduction + motion report |
-| `GET` | `/api/metrics` | 📊 Dashboard metrics |
+| `GET` | `/api/metrics` | 📊 Basic metrics |
 
 ---
 
@@ -126,15 +154,18 @@ Indexing runs **asynchronously in a background thread** — the UI polls `GET /a
 ```
 ├── .gitignore                # Excludes videos, node_modules, storage, venv
 ├── backend/
-│   ├── main.py              # FastAPI server (9 endpoints + async indexing)
-│   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, progress tracking)
+│   ├── main.py              # FastAPI server (14 endpoints + async indexing)
+│   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, benchmarks, metadata)
+│   ├── search_engine.py     # Enhanced search: detection + weighted scoring + suggestions
+│   ├── detector.py          # Grounding DINO zero-shot object detection (lazy-loaded)
+│   ├── benchmark.py         # Thread-safe performance metrics tracking
 │   └── storage/             # originals/, frames/, clips/, reports/
 ├── frontend/
-│   └── src/App.jsx          # React dashboard with live progress bar + ETA
+│   └── src/App.jsx          # Google-like search, rich cards, dashboard, timeline
 ├── Docs/
 │   ├── TECHNICAL_BRIEF.md   # Full project justification
 │   └── SceneTrace_AI_Final_Idea.md
-├── test_workflow.ps1        # 7-step automated test suite
+├── test_workflow.ps1        # 12-step automated test suite
 ├── stop_servers.ps1         # Kill servers on ports 8000 & 5173
 └── README.md
 ```
@@ -147,18 +178,21 @@ Indexing runs **asynchronously in a background thread** — the UI polls `GET /a
 .\test_workflow.ps1 -VideoPath test.mp4
 ```
 
-Validates: health → upload → index (with progress polling) → status → search → report → metrics.
+Validates (12 tests): health → upload → index (progress polling) → status → search(v1) → report → **v2 search** → **suggestions** → **dashboard metrics** → **timeline** → **objects**
 
 ---
 
 ## 🏆 Why It Wins
 
-- **✅ Fully working end-to-end** — Not a prototype. Upload any `.mp4`, type any query, get results.
+- **✅ Zero-shot detection** — Grounding DINO localizes any object in the query on result thumbnails. No training needed.
+- **✅ Explainable AI** — Every result shows a score breakdown (semantic, object, tracking, temporal) with a "Why this matched" explanation panel.
+- **✅ Google-like UX** — Rich search cards, autocomplete suggestions, score breakdown bars, dashboard metrics, event timeline.
+- **✅ Performance dashboard** — Real-time metrics: indexing speed (fps), avg query latency, frame reduction %, GPU status.
+- **✅ Fully working end-to-end** — Not a prototype. Upload any `.mp4`, type any query, get results with bounding boxes.
 - **✅ Live demo** — Running on this machine at `localhost:5173`. Judges can test it in 30 seconds.
-- **✅ No cloud dependency** — All on-device (CLIP, FAISS, FastAPI). Private, free, offline-capable.
+- **✅ No cloud dependency** — All on-device (CLIP, FAISS, Grounding DINO, FastAPI). Private, free, offline-capable.
 - **✅ Semantic understanding** — CLIP matches by concept, not keyword. "Red jacket" works in any lighting, any angle.
-- **✅ Optimized for real footage** — 97% frame reduction, ~5s query time, handles 4K video.
-- **✅ Measured results** — Every claim backed by wall-clock timing, verified by automated test suite.
+- **✅ Optimized for real footage** — 97% frame reduction, ~5s query time, async indexing with progress bar.
 
 ---
 

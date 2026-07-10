@@ -42,24 +42,24 @@ A system that:
 ### Technical Architecture
 
 ```
-                     INDEXING PIPELINE
+                     INDEXING PIPELINE (Async)
 ┌──────────┐    ┌──────────────┐    ┌────────────────┐    ┌───────────┐
 │  Upload  │───▶│ Motion Scan  │───▶│ Parallel Frame │───▶│  CLIP     │
 │  Video   │    │ (160×90,     │    │ Extraction     │    │ Embedding │
 │  (.mp4)  │    │  stride=3,   │    │ (4 threads)    │    │ (batch=32)│
 └──────────┘    │  adaptive %) │    └────────────────┘    └─────┬─────┘
-                └──────────────┘                                │
-                                                    ┌───────────▼──────┐
-                                                    │  FAISS Vector    │
-                                                    │  Search Index    │
-                                                    │ (IVFFlat / Flat) │
-                                                    └───────────┬──────┘
-                                                                │
-                                                     ┌──────────▼──────┐
-                                                     │  Thumbnails +   │
-                                                     │  index.json     │
-                                                     │  (persisted)    │
-                                                     └─────────────────┘
+                └──────────────┘            ↑                   │
+                     │                      │    ┌──────────────▼──────┐
+                     │  Live Progress ──────┤    │  FAISS Vector       │
+                     │  (polled every       │    │  Search Index       │
+                     │   800ms from UI)     │    │ (IVFFlat / Flat)    │
+                     ▼                      │    └──────────────┬──────┘
+               ┌────────────┐               │                   │
+               │ Background │               │    ┌──────────────▼──────┐
+               │ Thread in  │───────────────┘    │  Thumbnails +       │
+               │ ThreadPool │                    │  index.json         │
+               │ Executor   │                    │  (persisted)        │
+               └────────────┘                    └─────────────────────┘
 
                      QUERY PIPELINE
 ┌──────────┐     ┌────────────────┐    ┌───────────┐    ┌────────────────┐
@@ -87,6 +87,8 @@ A system that:
 | **Parallel extraction** | ThreadPoolExecutor (4 workers) | 3–4× faster than sequential frame reading |
 | **Vector index** | FAISS IVFFlat (or FlatIP for <50 vectors) | O(log n) approximate search at 100K+ vectors; falls back to exact for small sets |
 | **CLIP batching** | 32 frames per batch | Maximizes GPU utilization; up to 32× throughput vs. single-image |
+| **Async indexing** | Background thread via ThreadPoolExecutor | `/index` returns immediately; frontend polls progress endpoint |
+| **Progress tracking** | Shared dict updated per stage/batch | Real-time `{stage, percent, message, eta_seconds}` — no WebSocket needed |
 | **Index persistence** | JSON serialization to disk | Survives server restarts — no re-indexing needed |
 | **Confidence gating** | HIGH > 0.25, MEDIUM > 0.15, LOW < 0.15 | Prevents false positives from weak semantic matches |
 
@@ -165,8 +167,9 @@ The problem requires:
 
 **This is not a slideshow or a mockup.** The system is running on this machine at this moment:
 
-- **Backend API:** `http://localhost:8000` (FastAPI, 8 endpoints)
+- **Backend API:** `http://localhost:8000` (FastAPI, 10 endpoints)
 - **Frontend UI:** `http://localhost:5173` (React + Vite + Tailwind)
+- **Live progress bar:** Real-time stage, percentage, and ETA displayed during indexing via polling
 - **GPU:** CUDA-enabled CLIP inference
 - **Storage:** Local filesystem — videos, keyframes, indexes, and clips
 

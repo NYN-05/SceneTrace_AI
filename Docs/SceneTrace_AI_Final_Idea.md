@@ -34,6 +34,7 @@ SceneTrace AI transforms recorded videos into searchable visual evidence by allo
 |---------|-------------|
 | Natural Language Search | Type plain English queries instead of browsing videos manually |
 | Semantic Video Retrieval | CLIP embeddings enable concept-level matching, not keyword search |
+| Live Progress Tracking | Real-time progress bar with stage name, percentage, and ETA during indexing |
 | Confidence Gating | Results classified as HIGH (>0.25), MEDIUM (>0.15), or LOW confidence |
 | Evidence Reports | Per-video reports with frame reduction %, motion activity, and keyframe count |
 | Index Persistence | Indexes survive server restarts via JSON serialization + disk reload |
@@ -123,7 +124,9 @@ npm run dev
 
 1. Open `http://localhost:5173` in a browser
 2. **Upload tab:** Click file picker → select `.mp4` → click "Upload & Index"
-   - Status shows: Uploading → Indexing... (progress in terminal) → Ready (N keyframes)
+   - Status shows: Uploading → Starting index...
+   - **Live progress bar** appears with: animated gradient bar, stage name (Motion scan → Embedding → Saving), percentage, and ETA
+   - Completes with: "Ready — N keyframes indexed"
 3. **Search tab:** Type a query → press Enter or click "Search"
    - Example: `"a red circle moving"` or `"person near entrance"`
 4. Results show:
@@ -185,7 +188,21 @@ IVFFlat parameters: `nlist = sqrt(n)`, `nprobe = nlist / 4`
 
 Consecutive frame indices with a gap ≤ 3 are grouped into a single segment. Each segment gets an average confidence score. Segments are sorted by score descending.
 
-### 5.5 Persistence
+### 5.5 Async Indexing with Live Progress
+
+Indexing runs in a **background thread** via `ThreadPoolExecutor` — the `/index` endpoint returns immediately, and the frontend polls `/index-progress` every 800ms for real-time updates.
+
+**Progress stages mapped to percentage:**
+| Stage | Percent | What happens |
+|-------|---------|-------------|
+| Motion scan | 0–18% | Farneback optical flow on every 3rd frame |
+| Frame extraction | 18–25% | Parallel extraction of surviving keyframes (4 threads) |
+| CLIP embedding | 25–85% | Batched GPU inference, updates per batch |
+| Saving | 85–100% | Thumbnails written + index.json serialized |
+
+Each update includes `stage`, `percent`, `message` (human-readable stage description), and `eta_seconds` (estimated time remaining). The frontend displays an animated gradient progress bar with this data.
+
+### 5.6 Persistence
 
 After indexing, the full `VideoIndex` dataclass (frame_indices, timestamps, embeddings, motion_scores, total_frames) is serialized to `storage/frames/{video_id}/index.json`. On server startup, the lifespan handler reloads all saved indexes from disk.
 
@@ -199,9 +216,10 @@ All endpoints are prefixed with `/api`. The frontend Vite dev server proxies `/a
 |--------|----------|-------------|---------|----------|
 | GET | `/api/health` | Server status | — | `{status, indexed_videos}` |
 | POST | `/api/videos/upload` | Upload video | multipart file | `{video_id, filename, size}` |
-| POST | `/api/videos/{id}/index` | Start indexing | — | `{video_id, keyframes, total_frames, status}` |
-| GET | `/api/videos/{id}/status` | Index status | — | `{video_id, keyframes, timestamps, status}` |
-| POST | `/api/search` | Search by query | `{query, top_k}` | `{video_id, segments[], query_info, status}` |
+| POST | `/api/videos/{id}/index` | Start async indexing | — | `{video_id, status: "indexing_started"}` |
+| GET | `/api/videos/{id}/index-progress` | Poll indexing progress | — | `{stage, percent, message, eta_seconds, ...}` |
+| GET | `/api/videos/{id}/status` | Index readiness | — | `{video_id, keyframes, timestamps, status}` |
+| POST | `/api/search` | Semantic search | `{query, top_k}` | `{video_id, segments[], query_info, status}` |
 | GET | `/api/clips/{id}` | Download clip | query: `start_frame, end_frame` | MP4 file |
 | GET | `/api/reports/{id}` | Generate report | — | `{video_id, keyframes_count, frame_reduction_pct, ...}` |
 | GET | `/api/metrics` | Dashboard metrics | — | `{videos_indexed, total_keyframes, videos[]}` |
@@ -240,9 +258,10 @@ The CLIP embedding stage is the dominant bottleneck for long videos. It scales l
 
 ```
 AUTOMATE/
+├── .gitignore                # Excludes videos, node_modules, __pycache__, storage, venv
 ├── backend/
-│   ├── main.py              # FastAPI server (8 endpoints + lifespan handler)
-│   ├── pipeline.py          # CV pipeline (motion sampling, CLIP, FAISS, extraction)
+│   ├── main.py              # FastAPI server (10 endpoints + lifespan handler + async indexing)
+│   ├── pipeline.py          # CV pipeline (motion sampling, CLIP, FAISS, extraction, progress)
 │   └── storage/             # Local data storage
 │       ├── originals/       # Uploaded video files
 │       ├── frames/          # Keyframe thumbnails + index.json per video
@@ -250,7 +269,7 @@ AUTOMATE/
 │       └── reports/         # Generated JSON reports
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx          # Main React component (upload + search + results)
+│   │   ├── App.jsx          # Main React component (upload + search + progress bar + results)
 │   │   ├── main.jsx         # Entry point
 │   │   └── index.css        # Tailwind imports
 │   ├── index.html           # HTML shell
@@ -261,9 +280,10 @@ AUTOMATE/
 ├── Docs/
 │   ├── SceneTrace_AI_Final_Idea.md  # This document
 │   ├── SceneTrace_AI_Hackathon_Doc.docx
+│   ├── TECHNICAL_BRIEF.md   # Full project justification
 │   └── PS.png
 ├── stop_servers.ps1         # Kill processes on ports 8000 and 5173
-├── test_workflow.ps1        # End-to-end API test script
+├── test_workflow.ps1        # End-to-end API test script (with progress polling)
 └── README.md                # Quick-start guide
 ```
 
@@ -271,10 +291,10 @@ AUTOMATE/
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `backend/pipeline.py` | ~200 | Core CV pipeline: motion sample, embedding, search, clip extraction |
-| `backend/main.py` | ~150 | FastAPI application: routes, middleware, lifespan, thread pool |
-| `frontend/src/App.jsx` | ~135 | React SPA: upload, search, results display, activity log |
-| `test_workflow.ps1` | ~100 | Automated API test: health → upload → index → search → report |
+| `backend/pipeline.py` | ~253 | Core CV pipeline: motion sample, embedding, search, clip extraction, progress tracking |
+| `backend/main.py` | ~180 | FastAPI application: routes, middleware, lifespan, thread pool, async index, progress endpoint |
+| `frontend/src/App.jsx` | ~218 | React SPA: upload, search, results, progress bar with ETA, polling, activity log |
+| `test_workflow.ps1` | ~100 | Automated API test: health → upload → index (with progress polling) → search → report |
 
 ---
 

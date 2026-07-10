@@ -4,7 +4,7 @@
 
 ### *"Show me the person in a red jacket near the entrance."* — and it finds it.
 
-**Natural Language Video Grounding** · Hackathon Submission · Problem Statement #5
+**Natural Language Video Grounding** · Hackathon Submission · Problem Statement #5 · [Team Return0]
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -64,7 +64,10 @@ Each keyframe → 512-dim vector via `openai/clip-vit-base-patch32`. The user's 
 ### 3️⃣ FAISS Vector Search
 Milliseconds to search. IVFFlat for large indexes, FlatIP fallback for small ones. Results clustered into coherent segments by frame-index proximity.
 
-### 4️⃣ Confidence Gating
+### ⏳ Live Progress Tracking
+Indexing runs **asynchronously in a background thread** — the UI polls `GET /api/videos/{id}/index-progress` every 800ms and displays a real-time progress bar with **stage name** (motion scan → extract → embed → save), **percentage**, and **ETA**. No more staring at a spinner.
+
+### 5️⃣ Confidence Gating
 | Level | Threshold | Behavior |
 |-------|-----------|----------|
 | 🟢 HIGH | > 0.25 | Strong semantic match |
@@ -121,12 +124,13 @@ Milliseconds to search. IVFFlat for large indexes, FlatIP fallback for small one
 ## 📁 Project Structure
 
 ```
+├── .gitignore                # Excludes videos, node_modules, storage, venv
 ├── backend/
-│   ├── main.py              # FastAPI server (9 endpoints)
-│   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS)
+│   ├── main.py              # FastAPI server (9 endpoints + async indexing)
+│   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, progress tracking)
 │   └── storage/             # originals/, frames/, clips/, reports/
 ├── frontend/
-│   └── src/App.jsx          # React dashboard with progress bar
+│   └── src/App.jsx          # React dashboard with live progress bar + ETA
 ├── Docs/
 │   ├── TECHNICAL_BRIEF.md   # Full project justification
 │   └── SceneTrace_AI_Final_Idea.md

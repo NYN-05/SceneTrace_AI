@@ -14,6 +14,9 @@ STORAGE = Path(__file__).parent / "storage"
 for _d in ["originals", "frames", "clips", "reports"]:
     (STORAGE / _d).mkdir(parents=True, exist_ok=True)
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+_HAS_FAISS_INDEX = set()
+
 @dataclass
 class VideoIndex:
     video_id: str
@@ -25,7 +28,21 @@ class VideoIndex:
     metadata: dict = field(default_factory=lambda: {"fps": 0, "width": 0, "height": 0, "duration": 0})
     benchmarks: dict = field(default_factory=lambda: {"scan_time": 0, "extract_time": 0, "embed_time": 0, "total_time": 0})
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+    def faiss_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "index.faiss"
+
+    def get_faiss_index(self) -> faiss.Index | None:
+        p = self.faiss_path()
+        if p.exists():
+            return faiss.read_index(str(p))
+        return None
+
+    def save_faiss_index(self, index: faiss.Index):
+        p = self.faiss_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(p))
+        _HAS_FAISS_INDEX.add(self.video_id)
+
 from transformers import CLIPModel, CLIPProcessor
 _clip_model = None
 _clip_processor = None
@@ -39,7 +56,7 @@ def _get_clip():
         print("CLIP model loaded")
     return _clip_model, _clip_processor
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 32,
                        progress: dict = None) -> np.ndarray:
     model, processor = _get_clip()
@@ -61,17 +78,25 @@ def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 32,
             progress["eta_seconds"] = int(elapsed / eff * (100 - eff))
     return np.concatenate(all_embs, axis=0).astype("float32")
 
-@torch.no_grad()
+@torch.inference_mode()
 def embed_text(texts: list[str]) -> np.ndarray:
     model, processor = _get_clip()
     inputs = processor(text=texts, return_tensors="pt", padding=True).to(device)
     return model.get_text_features(**inputs).cpu().numpy().astype("float32")
 
+def _motion_score_farneback(prev_gray, gray):
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    return float(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2).mean())
+
+def _motion_score_diff(prev_gray, gray):
+    return float(np.abs(gray.astype("i2") - prev_gray.astype("i2")).mean())
+
 def motion_sample(video_path: str, stride: int = 3, target_pct: float = 5.0,
-                  progress: dict = None) -> tuple[list[int], list[float], list[float], int]:
+                  progress: dict = None, method: str = "diff") -> tuple[list[int], list[float], list[float], int]:
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    score_fn = _motion_score_farneback if method == "farneback" else _motion_score_diff
     start = time.time()
     candidate_frames, timestamps, motion_mags = [], [], []
     prev_gray = None
@@ -94,15 +119,13 @@ def motion_sample(video_path: str, stride: int = 3, target_pct: float = 5.0,
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (160, 90))
         if prev_gray is not None:
-            flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-            mag = float(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2).mean())
+            mag = score_fn(prev_gray, gray)
             motion_mags.append(mag)
             candidate_frames.append(count - 1)
             timestamps.append((count - 1) / fps)
         prev_gray = gray
     cap.release()
     elapsed = time.time() - start
-    # Adaptive threshold: keep top `target_pct` percentile of motion frames
     if not motion_mags:
         return [0], [0.0], [0.0], total_frames
     thresh = np.percentile(motion_mags, max(0, 100 - target_pct))
@@ -117,7 +140,7 @@ def motion_sample(video_path: str, stride: int = 3, target_pct: float = 5.0,
         keep_frames.insert(0, 0)
         ts.insert(0, 0.0)
         sc.insert(0, sc[0] if sc else 0.0)
-    print(f"  Motion scan: {count} frames in {elapsed:.1f}s, thresh={thresh:.2f}, kept={len(keep_frames)} ({100*len(keep_frames)//max(count,1)}%)")
+    print(f"  Motion scan: {count} frames in {elapsed:.1f}s ({method}), thresh={thresh:.2f}, kept={len(keep_frames)} ({100*len(keep_frames)//max(count,1)}%)")
     return keep_frames, ts, sc, total_frames
 
 def _extract_chunk(video_path: str, indices: list[int]) -> list[tuple[int, np.ndarray]]:
@@ -145,29 +168,29 @@ def extract_frames_parallel(video_path: str, frame_indices: list[int], num_worke
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
     n, d = embeddings.shape
+    embeddings = embeddings.copy()
+    faiss.normalize_L2(embeddings)
     if n < 50:
         idx = faiss.IndexFlatIP(d)
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        idx.add(embeddings / norms)
+        idx.add(embeddings)
         return idx
     nlist = max(1, int(np.sqrt(n)))
     quant = faiss.IndexFlatIP(d)
     idx = faiss.IndexIVFFlat(quant, d, nlist, faiss.METRIC_INNER_PRODUCT)
     idx.train(embeddings)
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1
-    idx.add(embeddings / norms)
+    idx.add(embeddings)
     idx.nprobe = max(1, nlist // 4)
     return idx
 
-def search_embeddings(query: str, embeddings: np.ndarray, top_k: int = 10) -> tuple[list[int], list[float]]:
+def search_embeddings(query: str, index: faiss.Index | None, embeddings: np.ndarray, top_k: int = 10) -> tuple[list[int], list[float]]:
     q_emb = embed_text([query])
     n = len(embeddings)
     if n == 0:
         return [], []
-    index = build_faiss_index(embeddings)
-    q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-8)
+    if index is None:
+        index = build_faiss_index(embeddings)
+    q_norm = q_emb.copy()
+    faiss.normalize_L2(q_norm)
     scores, indices = index.search(q_norm, min(top_k, n))
     return indices[0].tolist(), scores[0].tolist()
 
@@ -242,15 +265,26 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
                      metadata={"fps": round(fps, 2), "width": width, "height": height, "duration": round(total / max(fps, 1), 2)},
                      benchmarks={"scan_time": round(t1 - t0, 2), "extract_time": round(t2 - t1, 2),
                                  "embed_time": round(t3 - t2, 2), "total_time": round(t3 - t0, 2)})
+
+    t4 = time.time()
+    faiss_index = build_faiss_index(embs)
+    tf = time.time()
+    print(f"  FAISS index build: {tf-t4:.1f}s")
+    if progress is not None:
+        progress["percent"] = 88
+        progress["message"] = f"Built FAISS index..."
+
     out_dir = STORAGE / "frames" / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    idx.save_faiss_index(faiss_index)
+
     if progress is not None:
         progress["stage"] = "save"
         progress["percent"] = 90
         progress["message"] = f"Saving {len(keep_frames)} thumbnails..."
     def _save(idx_frame):
         i, f_idx = idx_frame
-        cv2.imwrite(str(out_dir / f"frame_{f_idx}.jpg"), frames[i], [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        cv2.imwrite(str(out_dir / f"frame_{f_idx}.jpg"), frames[i], [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     with ThreadPoolExecutor(max_workers=4) as pool:
         pool.map(_save, enumerate(keep_frames))
     with open(out_dir / "index.json", "w") as f:
@@ -262,6 +296,6 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["keyframes"] = len(keep_frames)
         progress["total_frames"] = total
     bm.record_index(t1 - t0, t2 - t1, t3 - t2, t3 - t0, total, len(keep_frames))
-    print(f"  Times: scan={t1-t0:.1f}s, extract={t2-t1:.1f}s, embed={t3-t2:.1f}s, total={t3-t0:.1f}s")
+    print(f"  Times: scan={t1-t0:.1f}s, extract={t2-t1:.1f}s, embed={t3-t2:.1f}s, faiss={tf-t4:.1f}s, total={t3-t0:.1f}s")
     print(f"Indexed {video_id}: {len(keep_frames)} keyframes from {total} total frames")
     return idx

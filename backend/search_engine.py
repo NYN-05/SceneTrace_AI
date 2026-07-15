@@ -6,33 +6,34 @@ from pathlib import Path
 from pipeline import STORAGE, search_embeddings, frames_to_segments
 from benchmark import benchmark
 
-def _get_detections_for_segment(seg, query, cache={}):
+_DET_CACHE: dict[str, list] = {}
+
+def _get_detections_for_segment(seg, query):
     """Run Grounding DINO on the middle frame of a segment. Cache results."""
     vid, indices = seg["video_id"], seg["frame_indices"]
     mid = indices[len(indices) // 2]
     key = f"{vid}_{mid}"
-    if key in cache:
-        return cache[key]
+    if key in _DET_CACHE:
+        return _DET_CACHE[key]
     from detector import detect
     img_path = STORAGE / "frames" / vid / f"frame_{mid}.jpg"
     if not img_path.exists():
-        cache[key] = []
+        _DET_CACHE[key] = []
         return []
     img = cv2.imread(str(img_path))
     if img is None:
-        cache[key] = []
+        _DET_CACHE[key] = []
         return []
     try:
         dets = detect(img, query, threshold=0.2)
     except Exception:
         dets = []
-    # Save annotated version
     if dets:
         from detector import render
         annotated = render(img, dets)
         out = STORAGE / "frames" / vid / f"frame_{mid}_d.jpg"
         cv2.imwrite(str(out), annotated)
-    cache[key] = dets
+    _DET_CACHE[key] = dets
     return dets
 
 def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = True) -> dict:
@@ -45,7 +46,8 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
         embs = np.array(idx.embeddings, dtype="float32")
         if len(embs) == 0:
             continue
-        indices, scores = search_embeddings(query, embs, top_k * 3)
+        faiss_idx = idx.get_faiss_index()
+        indices, scores = search_embeddings(query, faiss_idx, embs, top_k * 3)
         segs = frames_to_segments(indices, scores)
         for s in segs:
             s["video_id"] = vid
@@ -59,10 +61,9 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
 
     # Object detection on top-K
     if enable_detection:
-        det_cache = {}
         for seg in segments:
             try:
-                dets = _get_detections_for_segment(seg, query, det_cache)
+                dets = _get_detections_for_segment(seg, query)
                 seg["detections"] = dets
                 obj_scores = [d["score"] * 0.5 for d in dets]
                 seg["object_score"] = round(sum(obj_scores) / max(len(obj_scores), 1), 4) if obj_scores else 0

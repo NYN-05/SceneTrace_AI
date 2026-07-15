@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 venv/
 .env
+.pytest_cache/
+*.faiss
+*.pkl
 
 # Node
 node_modules/
@@ -17,7 +20,7 @@ frontend/.vite/
 *.mkv
 *.webm
 
-# Backend storage (uploaded videos, keyframes, clips, reports)
+# Backend storage (uploaded videos, keyframes, clips, reports, FAISS indexes)
 backend/storage/
 
 # IDE
@@ -29,3 +32,6 @@ backend/storage/
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log

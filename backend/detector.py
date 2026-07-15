@@ -19,7 +19,7 @@ def load():
     _processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
     print("Grounding DINO loaded")
 
-@torch.no_grad()
+@torch.inference_mode()
 def detect(image: np.ndarray, text: str, threshold: float = 0.2) -> list[dict]:
     """Detect objects matching text in an image. Returns [{bbox, label, score}, ...]."""
     load()

@@ -147,8 +147,10 @@ async def search(req: SearchRequest):
         indices, scores = await loop.run_in_executor(executor, search_embeddings, req.query, faiss_idx, embs, req.top_k * 2)
         segs = frames_to_segments(indices, scores)
         for seg in segs:
+            orig = seg["frame_indices"]
             seg["video_id"] = video_id
-            seg["timestamps"] = [idx.timestamps[i] for i in seg["frame_indices"]]
+            seg["frame_indices"] = [idx.frame_indices[i] for i in orig]
+            seg["timestamps"] = [idx.timestamps[i] for i in orig]
             seg["avg_score"] = sum(seg["scores"]) / len(seg["scores"]) if seg["scores"] else 0
         segs.sort(key=lambda s: s["avg_score"], reverse=True)
         results.extend(segs[:req.top_k])

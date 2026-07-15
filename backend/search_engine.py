@@ -50,8 +50,10 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
         indices, scores = search_embeddings(query, faiss_idx, embs, top_k * 3)
         segs = frames_to_segments(indices, scores)
         for s in segs:
+            orig = s["frame_indices"]
             s["video_id"] = vid
-            s["timestamps"] = [idx.timestamps[i] for i in s["frame_indices"]]
+            s["frame_indices"] = [idx.frame_indices[i] for i in orig]
+            s["timestamps"] = [idx.timestamps[i] for i in orig]
             s["semantic_score"] = sum(s["scores"]) / len(s["scores"]) if s["scores"] else 0
         segs.sort(key=lambda s: s["semantic_score"], reverse=True)
         candidates.extend(segs[:top_k * 2])

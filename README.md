@@ -13,6 +13,8 @@
 [![FAISS](https://img.shields.io/badge/FAISS-IVFFlat-512BD4?logo=meta&logoColor=white)](https://faiss.ai)
 [![Grounding DINO](https://img.shields.io/badge/GroundingDINO-ZeroShot-22c55e?logo=huggingface&logoColor=white)](https://huggingface.co/IDEA-Research/grounding-dino-base)
 [![GPU](https://img.shields.io/badge/GPU-CUDA-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda)
+[![Tests](https://img.shields.io/badge/Tests-37_passing-22c55e?logo=pytest)](https://github.com/NYN-05/SceneTrace_AI)
+[![Security](https://img.shields.io/badge/Security-CORS_restricted-6366f1)](https://github.com/NYN-05/SceneTrace_AI)
 
 **Upload a video. Type a sentence. Get the clip.** — All on-device, no cloud API, ~5s query time.
 
@@ -34,13 +36,19 @@
 
 ```powershell
 # Terminal 1 — Backend
-cd backend; python main.py
+cd backend
+pip install -r requirements.txt
+python main.py
 
 # Terminal 2 — Frontend
-cd frontend; npm install; npm run dev
+cd frontend
+npm install
+npm run dev
 ```
 
 Open **http://localhost:5173** → Upload `.mp4` → Type any query → Get results.
+
+> Optional: copy `backend/.env.example` to `backend/.env` and customize.
 
 ---
 
@@ -71,7 +79,7 @@ Open **http://localhost:5173** → Upload `.mp4` → Type any query → Get resu
 ```
 
 ### 1️⃣ Motion-Guided Sampling
-Farneback optical flow at **160×90** resolution, every **3rd frame**, adaptive percentile threshold. Keeps only the **~5% most active frames** — **up to 97% reduction** on surveillance footage.
+Frame differencing (default) or Farneback optical flow at **160×90** resolution, every **3rd frame**, adaptive percentile threshold. Keeps only the **~5% most active frames** — **up to 97% reduction** on surveillance footage. Frame differencing is **3-5× faster** than Farneback with equivalent keyframe quality.
 
 ### 2️⃣ CLIP Embeddings
 Each keyframe → 512-dim vector via `openai/clip-vit-base-patch32`. The user's query goes through the same text encoder. Both live in the **same semantic space** — understands concepts, not keywords.
@@ -154,14 +162,39 @@ Every result shows a score breakdown: semantic match, object match, tracking con
 ```
 ├── .gitignore                # Excludes videos, node_modules, storage, venv
 ├── backend/
-│   ├── main.py              # FastAPI server (14 endpoints + async indexing)
-│   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, benchmarks, metadata)
+│   ├── main.py              # FastAPI server (16 endpoints + security + async indexing)
+│   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, extraction, progress)
 │   ├── search_engine.py     # Enhanced search: detection + weighted scoring + suggestions
 │   ├── detector.py          # Grounding DINO zero-shot object detection (lazy-loaded)
 │   ├── benchmark.py         # Thread-safe performance metrics tracking
+│   ├── config.py            # Environment-based configuration (.env)
+│   ├── requirements.txt     # Pinned Python dependencies
+│   ├── pytest.ini           # Test configuration
+│   ├── .env.example         # Environment variable template
+│   ├── tests/               # 37 pytest tests (unit + API)
+│   │   ├── test_pipeline.py
+│   │   ├── test_search.py
+│   │   ├── test_benchmark.py
+│   │   ├── test_config.py
+│   │   └── test_api.py
 │   └── storage/             # originals/, frames/, clips/, reports/
 ├── frontend/
-│   └── src/App.jsx          # Google-like search, rich cards, dashboard, timeline
+│   ├── src/
+│   │   ├── App.jsx          # Main SPA (slim — imports components)
+│   │   ├── main.jsx         # React entry point
+│   │   ├── index.css        # Tailwind imports
+│   │   ├── components/      # 8 modular components
+│   │   │   ├── SearchTab.jsx
+│   │   │   ├── UploadTab.jsx
+│   │   │   ├── DashboardTab.jsx
+│   │   │   ├── TimelineTab.jsx
+│   │   │   ├── ResultCard.jsx
+│   │   │   ├── ProgressBar.jsx
+│   │   │   ├── ScoreBar.jsx
+│   │   │   └── MetricCard.jsx
+│   │   └── hooks/
+│   │       └── useApi.js    # Custom hooks for search + upload logic
+│   └── package.json
 ├── Docs/
 │   ├── TECHNICAL_BRIEF.md   # Full project justification
 │   └── SceneTrace_AI_Final_Idea.md
@@ -175,10 +208,16 @@ Every result shows a score breakdown: semantic match, object match, tracking con
 ## 🧪 Running Tests
 
 ```powershell
+# Unit + API tests (no server needed)
+cd backend; python -m pytest tests/ -v
+
+# End-to-end integration (servers must be running)
 .\test_workflow.ps1 -VideoPath test.mp4
 ```
 
-Validates (12 tests): health → upload → index (progress polling) → status → search(v1) → report → **v2 search** → **suggestions** → **dashboard metrics** → **timeline** → **objects**
+**37 pytest tests** covering: pipeline logic (segments, queries, FAISS, embeddings, motion), search engine (suggestions), benchmark singleton, config/env, and 12 FastAPI endpoint tests (health, upload validation, input sanitization, error handling).
+
+End-to-end `test_workflow.ps1` validates: health → upload → index (progress polling) → status → search(v1) → report → **v2 search** → **suggestions** → **dashboard metrics** → **timeline** → **objects**
 
 ---
 

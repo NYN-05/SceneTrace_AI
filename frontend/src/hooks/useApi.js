@@ -7,6 +7,7 @@ export function useUpload() {
   const [logs, setLogs] = useState([]);
   const [indexProgress, setIndexProgress] = useState(null);
   const [indexStartTime, setIndexStartTime] = useState(null);
+  const [lastVideoId, setLastVideoId] = useState(null);
   const pollingRef = useRef(null);
   const fileRef = useRef(null);
 
@@ -44,6 +45,7 @@ export function useUpload() {
       if (!r.ok) throw new Error(`Upload failed: ${r.status}`);
       const data = await r.json();
       log(`Uploaded: ${data.filename} (${data.video_id})`);
+      setLastVideoId(data.video_id);
       setStatus("Indexing...");
       const r2 = await fetch(`${API}/api/videos/${data.video_id}/index`, { method: "POST" });
       if (!r2.ok) throw new Error(`Index start failed: ${r2.status}`);
@@ -52,7 +54,9 @@ export function useUpload() {
     } catch (e) { setStatus(`Error: ${e.message}`); log(`Error: ${e.message}`); }
   }, [stopPolling, pollProgress, log]);
 
-  return { status, logs, indexProgress, indexStartTime, fileRef, upload, setLogs, setStatus };
+  const clearLastVideo = useCallback(() => setLastVideoId(null), []);
+
+  return { status, logs, indexProgress, indexStartTime, lastVideoId, clearLastVideo, fileRef, upload, setLogs, setStatus };
 }
 
 export function useSearch() {
@@ -63,15 +67,17 @@ export function useSearch() {
   const [hasSearched, setHasSearched] = useState(false);
   const searchInputRef = useRef(null);
 
-  const doSearch = useCallback(async (q, useV2 = true) => {
+  const doSearch = useCallback(async (q, useV2 = true, videoId = null) => {
     if (!q) return;
     setSearching(true); setResults(null); setSuggestions([]); setHasSearched(true);
     try {
       const endpoint = useV2 ? "/api/v2/search" : "/api/search";
+      const body = { query: q, top_k: 5, enable_detection: true };
+      if (videoId) body.video_id = videoId;
       const r = await fetch(`${API}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, top_k: 5, enable_detection: true }),
+        body: JSON.stringify(body),
       });
       if (!r.ok) throw new Error(`Search failed: ${r.status}`);
       const data = await r.json();

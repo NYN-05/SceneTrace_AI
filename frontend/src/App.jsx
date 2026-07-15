@@ -1,6 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import SearchTab from "./components/SearchTab";
-import UploadTab from "./components/UploadTab";
+import SearchPage from "./components/SearchPage";
 import DashboardTab from "./components/DashboardTab";
 import TimelineTab from "./components/TimelineTab";
 import { useUpload, useSearch } from "./hooks/useApi";
@@ -45,7 +44,6 @@ export default function App() {
 
   const tabs = [
     { key: "search", label: "🔍 Search" },
-    { key: "upload", label: "📤 Upload" },
     { key: "dashboard", label: "📊 Dashboard" },
     { key: "timeline", label: "⏳ Timeline" },
   ];
@@ -74,8 +72,20 @@ export default function App() {
         </div>
       </header>
       <main className="max-w-6xl mx-auto px-4 py-6">
-        {tab === "search" && <SearchTab {...search} setHasSearched={search.setHasSearched} />}
-        {tab === "upload" && <UploadTab {...upload} upload={() => upload.upload(onUploadDone)} />}
+        {tab === "search" && (
+          <SearchPage
+            {...search}
+            uploadStatus={upload.status}
+            uploadLogs={upload.logs}
+            indexProgress={upload.indexProgress}
+            indexStartTime={upload.indexStartTime}
+            fileRef={upload.fileRef}
+            lastVideoId={upload.lastVideoId}
+            clearLastVideo={upload.clearLastVideo}
+            upload={upload.upload}
+            onUploadDone={onUploadDone}
+          />
+        )}
         {tab === "dashboard" && <DashboardTab dashboardData={dashboardData} fetchDashboard={fetchDashboard} />}
         {tab === "timeline" && (
           <TimelineTab

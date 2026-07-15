@@ -64,11 +64,13 @@ app.mount("/api/frames", StaticFiles(directory=str(frames_dir)), name="frames")
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
     top_k: int = Field(default=5, ge=1, le=100)
+    video_id: str | None = None
 
 class V2SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
     top_k: int = Field(default=5, ge=1, le=100)
     enable_detection: bool = True
+    video_id: str | None = None
 
 @app.get("/api/health")
 def health():
@@ -135,10 +137,11 @@ def video_status(video_id: str):
 
 @app.post("/api/search")
 async def search(req: SearchRequest):
-    if not _indexes:
-        return JSONResponse(status_code=400, content={"detail": "No videos indexed.", "segments": []})
+    targets = {req.video_id: _indexes[req.video_id]} if req.video_id and req.video_id in _indexes else _indexes
+    if not targets:
+        return JSONResponse(status_code=400, content={"detail": "No videos indexed." if not req.video_id else f"Video {req.video_id} not found.", "segments": []})
     results = []
-    for video_id, idx in _indexes.items():
+    for video_id, idx in targets.items():
         embs = np.array(idx.embeddings, dtype="float32")
         if len(embs) == 0:
             continue
@@ -201,11 +204,12 @@ def metrics():
 
 @app.post("/api/v2/search")
 async def search_v2(req: V2SearchRequest):
-    if not _indexes:
-        return JSONResponse(status_code=400, content={"detail": "No videos indexed.", "segments": []})
+    targets = {req.video_id: _indexes[req.video_id]} if req.video_id and req.video_id in _indexes else _indexes
+    if not targets:
+        return JSONResponse(status_code=400, content={"detail": "No videos indexed." if not req.video_id else f"Video {req.video_id} not found.", "segments": []})
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
-        executor, enhanced_search, req.query, _indexes, req.top_k, req.enable_detection
+        executor, enhanced_search, req.query, targets, req.top_k, req.enable_detection
     )
     return result
 

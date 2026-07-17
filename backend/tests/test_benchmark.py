@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
-from benchmark import BenchmarkStats
+from config import BenchmarkStats
 
 def test_singleton():
     a = BenchmarkStats()

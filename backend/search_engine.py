@@ -5,8 +5,8 @@ import numpy as np
 import logging
 from pathlib import Path
 from cachetools import TTLCache
-from pipeline import STORAGE, search_embeddings, frames_to_segments
-from benchmark import benchmark
+from pipeline import STORAGE, search_embeddings, frames_to_segments, embed_text
+from config import benchmark
 from config import settings
 
 logger = logging.getLogger("scenetrace.search")
@@ -41,12 +41,41 @@ def _get_detections_for_segment(seg: dict, query: str) -> list:
     _DET_CACHE[key] = dets
     return dets
 
+def _search_objects_faiss(query: str, vid: str, idx,
+                          top_k: int = 15) -> dict[int, list[dict]]:
+    """Query the object-level FAISS index and return {frame_idx: [match_obj, ...]}."""
+    obj_faiss = idx.get_object_faiss_index()
+    obj_embs = idx.load_object_embeddings()
+    if obj_faiss is None or obj_embs is None or len(obj_embs) == 0:
+        return {}
+    if len(idx.object_metadata) != len(obj_embs):
+        return {}
+    q_emb = embed_text([query])
+    n = len(obj_embs)
+    scores, indices = obj_faiss.search(q_emb, min(top_k * 3, n))
+    frame_map: dict[int, list[dict]] = {}
+    for obj_idx, score in zip(indices[0], scores[0]):
+        meta = idx.object_metadata[obj_idx]
+        fi = meta["frame_idx"]
+        entry = {
+            "bbox": meta["bbox"],
+            "label": meta["label"],
+            "score": meta["score"],
+            "clip_similarity": round(float(score), 3),
+        }
+        if fi not in frame_map:
+            frame_map[fi] = []
+        frame_map[fi].append(entry)
+    return frame_map
+
+
 def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = True) -> dict:
     t0 = time.time()
     if not indexes:
         return {"segments": [], "status": "no_indexes", "query_info": {"raw": query}}
 
     candidates = []
+    object_frame_maps: dict[str, dict[int, list[dict]]] = {}
     for vid, idx in indexes.items():
         embs = idx.load_embeddings()
         if embs is None or len(embs) == 0:
@@ -63,20 +92,34 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
         segs.sort(key=lambda s: s["semantic_score"], reverse=True)
         candidates.extend(segs[:top_k * 2])
 
+        if enable_detection:
+            obj_map = _search_objects_faiss(query, vid, idx, top_k)
+            if obj_map:
+                object_frame_maps[vid] = obj_map
+
     candidates.sort(key=lambda s: s["semantic_score"], reverse=True)
     segments = candidates[:top_k]
 
     if enable_detection:
         for seg in segments:
-            try:
-                dets = _get_detections_for_segment(seg, query)
-                seg["detections"] = dets
-                obj_scores = [d["score"] * 0.5 for d in dets]
-                seg["object_score"] = round(sum(obj_scores) / max(len(obj_scores), 1), 4) if obj_scores else 0
-            except Exception as e:
-                logger.exception("Detection error on %s", seg.get("video_id"))
-                seg["detections"] = []
-                seg["object_score"] = 0
+            mid = seg["frame_indices"][len(seg["frame_indices"]) // 2]
+            vid = seg["video_id"]
+            use_indexed = vid in object_frame_maps and mid in object_frame_maps[vid]
+            if use_indexed:
+                objs = object_frame_maps[vid][mid]
+                seg["detections"] = objs
+                sims = [o["clip_similarity"] for o in objs]
+                seg["object_score"] = round(sum(sims) / len(sims), 4) if sims else 0
+            else:
+                try:
+                    dets = _get_detections_for_segment(seg, query)
+                    seg["detections"] = dets
+                    obj_scores = [d["score"] * 0.5 for d in dets]
+                    seg["object_score"] = round(sum(obj_scores) / max(len(obj_scores), 1), 4) if obj_scores else 0
+                except Exception:
+                    logger.exception("Detection error on %s", seg.get("video_id"))
+                    seg["detections"] = []
+                    seg["object_score"] = 0
     else:
         for seg in segments:
             seg["detections"] = []

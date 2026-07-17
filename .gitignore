@@ -28,6 +28,7 @@ backend/storage/
 .idea/
 *.swp
 *.swo
+.opencode/
 
 # OS
 .DS_Store
@@ -35,3 +36,4 @@ Thumbs.db
 
 # Logs
 *.log
+*.ps1

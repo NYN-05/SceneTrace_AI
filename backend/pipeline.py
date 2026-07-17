@@ -10,8 +10,9 @@ import threading
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from benchmark import benchmark as bm
+from config import benchmark as bm
 from config import settings, logger
+from detector import detect
 
 STORAGE = Path(__file__).parent / "storage"
 for _d in ["originals", "frames", "clips", "reports"]:
@@ -32,6 +33,7 @@ class VideoIndex:
     total_frames: int = 0
     metadata: dict = field(default_factory=lambda: {"fps": 0, "width": 0, "height": 0, "duration": 0})
     benchmarks: dict = field(default_factory=lambda: {"scan_time": 0, "extract_time": 0, "embed_time": 0, "total_time": 0})
+    object_metadata: list[dict] = field(default_factory=list)
 
     def faiss_path(self) -> Path:
         return STORAGE / "frames" / self.video_id / "index.faiss"
@@ -71,6 +73,43 @@ class VideoIndex:
 
     def save_embeddings(self, embeddings: np.ndarray):
         p = self.embeddings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(p), embeddings)
+
+    def object_embeddings_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "object_embeddings.npy"
+
+    def object_faiss_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "object_index.faiss"
+
+    def get_object_faiss_index(self) -> faiss.Index | None:
+        cache_key = f"{self.video_id}_objects"
+        with _faiss_cache_lock:
+            if cache_key in _faiss_index_cache:
+                return _faiss_index_cache[cache_key]
+        p = self.object_faiss_path()
+        if p.exists():
+            idx = faiss.read_index(str(p))
+            with _faiss_cache_lock:
+                _faiss_index_cache[cache_key] = idx
+            return idx
+        return None
+
+    def save_object_faiss_index(self, index: faiss.Index):
+        p = self.object_faiss_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(p))
+        with _faiss_cache_lock:
+            _faiss_index_cache[f"{self.video_id}_objects"] = index
+
+    def load_object_embeddings(self) -> np.ndarray | None:
+        p = self.object_embeddings_path()
+        if p.exists():
+            return np.load(str(p)).astype("float32")
+        return None
+
+    def save_object_embeddings(self, embeddings: np.ndarray):
+        p = self.object_embeddings_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(p), embeddings)
 
@@ -121,6 +160,17 @@ def embed_text(texts: list[str]) -> np.ndarray:
     emb = model.get_text_features(**inputs)
     emb = emb / emb.norm(dim=-1, keepdim=True)
     return emb.cpu().numpy().astype("float32")
+
+
+@torch.inference_mode()
+def embed_image(image: np.ndarray) -> np.ndarray:
+    model, processor = _get_clip()
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    inputs = processor(images=rgb, return_tensors="pt").to(device)
+    emb = model.get_image_features(**inputs)
+    emb = emb / emb.norm(dim=-1, keepdim=True)
+    return emb.cpu().numpy().astype("float32")[0]
+
 
 def _motion_score_farneback(prev_gray, gray):
     flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
@@ -283,6 +333,23 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["percent"] = 0
         progress["message"] = "Starting motion scan..."
     keep_frames, timestamps, motion_scores, total = motion_sample(str(video_path), progress=progress)
+
+    min_keyframes = int(total / max(fps, 1) * settings.INDEX_MIN_FPS)
+    if len(keep_frames) < min_keyframes:
+        logger.info("Enforcing min FPS: adding %d uniform frames to meet INDEX_MIN_FPS=%d",
+                    min_keyframes - len(keep_frames), settings.INDEX_MIN_FPS)
+        existing = set(keep_frames)
+        uniform = [int(f) for f in np.linspace(0, total - 1, min_keyframes, dtype=int) if f not in existing]
+        uniform = uniform[:min_keyframes - len(keep_frames)]
+        for f in uniform:
+            keep_frames.append(f)
+            timestamps.append(f / fps)
+            motion_scores.append(0.0)
+        combined = sorted(zip(keep_frames, timestamps, motion_scores), key=lambda x: x[0])
+        keep_frames = [c[0] for c in combined]
+        timestamps = [c[1] for c in combined]
+        motion_scores = [c[2] for c in combined]
+
     t1 = time.time()
     if progress is not None:
         progress["stage"] = "extract"
@@ -298,11 +365,51 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     logger.info("CLIP embeddings (%d frames)...", len(frames))
     embs = compute_embeddings(frames, progress=progress)
     t3 = time.time()
+
+    object_metadata: list[dict] = []
+    object_crops: list[np.ndarray] = []
+    object_embs: np.ndarray = np.empty((0, settings.INDEX_OBJECT_EMBED_DIM), dtype="float32")
+    t_od = t3
+    t_oe = t3
+    if progress is not None:
+        progress["stage"] = "detect_objects"
+        progress["message"] = f"Detecting objects in {len(frames)} keyframes..."
+    logger.info("Phase 1: detecting objects in %d keyframes...", len(frames))
+    t_od = time.time()
+    for fi_idx, (frame_idx, frame) in enumerate(zip(keep_frames, frames)):
+        try:
+            dets = detect(frame, settings.INDEX_DETECTION_PROMPTS, threshold=settings.INDEX_OBJECT_CONFIDENCE)
+        except Exception:
+            dets = []
+        for d in dets:
+            x1, y1, x2, y2 = d["bbox"]
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            object_metadata.append({
+                "frame_idx": frame_idx,
+                "bbox": d["bbox"],
+                "label": d["label"],
+                "score": d["score"],
+            })
+            object_crops.append(crop)
+        if progress is not None and (fi_idx + 1) % max(1, len(frames) // 5) == 0:
+            progress["message"] = f"Detected objects: {fi_idx+1}/{len(frames)} frames, {len(object_metadata)} found"
+    t_od_end = time.time()
+    if object_crops:
+        logger.info("CLIP encoding %d object crops...", len(object_crops))
+        object_embs = compute_embeddings(object_crops)
+    t_oe = time.time()
+    logger.info("Object detection: %d objects in %.1fs, embedding: %.1fs",
+                len(object_metadata), t_od_end - t_od, t_oe - t_od_end)
+
     idx = VideoIndex(video_id=video_id, frame_indices=keep_frames, timestamps=timestamps,
                      motion_scores=motion_scores, total_frames=total,
                      metadata={"fps": round(fps, 2), "width": width, "height": height, "duration": round(total / max(fps, 1), 2)},
                      benchmarks={"scan_time": round(t1 - t0, 2), "extract_time": round(t2 - t1, 2),
-                                 "embed_time": round(t3 - t2, 2), "total_time": round(t3 - t0, 2)})
+                                 "embed_time": round(t3 - t2, 2), "detection_time": round(t_oe - t3, 2),
+                                 "total_time": round(t_oe - t0, 2)},
+                     object_metadata=object_metadata)
 
     t4 = time.time()
     faiss_index = build_faiss_index(embs)
@@ -316,6 +423,12 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     out_dir.mkdir(parents=True, exist_ok=True)
     idx.save_faiss_index(faiss_index)
     idx.save_embeddings(embs)
+
+    if len(object_embs) > 0:
+        object_faiss_index = build_faiss_index(object_embs)
+        idx.save_object_faiss_index(object_faiss_index)
+        idx.save_object_embeddings(object_embs)
+        logger.info("Object FAISS index built: %d objects in %.1fs", len(object_embs), time.time() - t_oe)
 
     if progress is not None:
         progress["stage"] = "save"
@@ -339,8 +452,9 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["message"] = "Complete"
         progress["keyframes"] = len(keep_frames)
         progress["total_frames"] = total
-    bm.record_index(t1 - t0, t2 - t1, t3 - t2, t3 - t0, total, len(keep_frames))
-    logger.info("Times: scan=%.1fs, extract=%.1fs, embed=%.1fs, faiss=%.1fs, total=%.1fs",
-                t1 - t0, t2 - t1, t3 - t2, tf - t4, t3 - t0)
-    logger.info("Indexed %s: %d keyframes from %d total frames", video_id, len(keep_frames), total)
+    bm.record_index(t1 - t0, t2 - t1, t3 - t2, t_oe - t0, total, len(keep_frames))
+    logger.info("Times: scan=%.1fs, extract=%.1fs, embed=%.1fs, faiss=%.1fs, detection=%.1fs, total=%.1fs",
+                t1 - t0, t2 - t1, t3 - t2, tf - t4, t_oe - t3, t_oe - t0)
+    logger.info("Indexed %s: %d keyframes, %d objects, from %d total frames",
+                video_id, len(keep_frames), len(object_metadata), total)
     return idx

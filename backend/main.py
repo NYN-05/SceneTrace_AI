@@ -22,7 +22,7 @@ from slowapi.errors import RateLimitExceeded
 from pipeline import (STORAGE, VideoIndex, search_embeddings,
                       frames_to_segments, parse_query, index_video, extract_clip, device)
 from search_engine import search as enhanced_search, suggest as query_suggest
-from benchmark import benchmark
+from config import benchmark
 from config import settings, logger
 
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -62,6 +62,7 @@ def _load_persisted_indexes():
                     total_frames=data.get("total_frames", 0),
                     metadata=data.get("metadata", {}),
                     benchmarks=data.get("benchmarks", {}),
+                    object_metadata=data.get("object_metadata", []),
                 )
                 with _indexes_lock:
                     _indexes[vi.video_id] = vi

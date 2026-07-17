@@ -34,14 +34,14 @@ SceneTrace AI transforms recorded videos into searchable visual evidence by allo
 |---------|-------------|
 | Natural Language Search | Type plain English queries instead of browsing videos manually |
 | Semantic Video Retrieval | CLIP embeddings enable concept-level matching, not keyword search |
-| Zero-Shot Object Localization | Grounding DINO detects arbitrary objects from query text on result frames |
+| Zero-Shot Object Localization | YOLO-World-L (auto fallback M→S) or Grounding DINO detects arbitrary objects from query text |
 | Weighted Explainable Scoring | 55% semantic + 45% object match with full score breakdown and explanation |
 | Live Progress Tracking | Real-time progress bar with stage name, percentage, and ETA during indexing |
 | Confidence Gating | Results classified as HIGH (>0.25), MEDIUM (>0.15), or LOW confidence |
 | Performance Dashboard | Live metrics: indexing speed (fps), avg query latency, frame reduction %, GPU status |
 | Event Timeline | Per-video frame timeline with motion scores and thumbnail previews |
 | Evidence Reports | Per-video reports with frame reduction %, motion activity, and keyframe count |
-| Index Persistence | Indexes survive server restarts via JSON serialization + disk reload |
+| Index Persistence | Indexes survive server restarts via JSON + FAISS binary serialization + disk reload |
 
 ---
 
@@ -65,8 +65,9 @@ SceneTrace AI transforms recorded videos into searchable visual evidence by allo
 8.  User enters natural language query
 9.  CLIP text embedding + FAISS search → candidate frame indices
 10. Frame-index gap clustering → initial segments
-11. Grounding DINO object detection on middle frame of each segment
-12. Weighted scoring: 55% semantic (CLIP) + 45% object match (Grounding DINO)
+11. YOLO-World-L object detection on middle frame of each segment
+    (auto falls back to YOLO-World-M → YOLO-World-S on failure)
+12. Weighted scoring: 55% semantic (CLIP) + 45% object match (YOLO-World)
 13. Score breakdown + explanation generated for each segment
 14. Rich search cards displayed: thumbnails, bboxes, labels, score bars, explanation
 ```
@@ -75,18 +76,18 @@ SceneTrace AI transforms recorded videos into searchable visual evidence by allo
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| Motion Analysis | OpenCV Farneback Optical Flow (160×90) | 200+ FPS motion saliency at 4× reduced resolution |
+| Motion Analysis | OpenCV Farneback Optical Flow (160×90) | 200+ FPS motion saliency at 4x reduced resolution |
 | Frame Sampling | Adaptive percentile threshold (stride=3) | Auto-tunes to keep ~5% of frames per video |
 | Parallel I/O | ThreadPoolExecutor (4 workers) | Concurrent frame extraction |
 | Vision-Language | CLIP ViT-B/32 (HuggingFace Transformers) | Batched GPU inference, 512-dim embeddings |
-| Open-Vocab Detection | Grounding DINO (HuggingFace Transformers) | Zero-shot object localization from query text |
-| Weighted Scoring | Search Engine module | 55% CLIP semantic + 45% Grounding DINO object match |
+| Open-Vocab Detection | YOLO-World-L with auto fallback (L→M→S) | Zero-shot object localization from query text |
+| Weighted Scoring | Search Engine module | 55% CLIP semantic + 45% object match |
 | Vector Search | FAISS IndexIVFFlat | O(log n) approximate nearest neighbor search |
 | Segment Clustering | Frame-index gap threshold | Groups consecutive high-scoring frames |
-| Performance Tracking | Benchmark singleton (thread-safe) | Real-time indexing speed, query latency, frame reduction |
+| Performance Tracking | BenchmarkStats singleton (in config.py, thread-safe) | Real-time indexing speed, query latency, frame reduction |
 | Backend | FastAPI + ThreadPoolExecutor | Async endpoints, CPU tasks offloaded, 14 endpoints |
 | Frontend | React + Vite + Tailwind CSS | Google-like search, rich cards, dashboard, timeline |
-| Storage | Local filesystem (JSON) | Index persistence across restarts |
+| Storage | Local filesystem (JSON + FAISS binary) | Index persistence across restarts |
 
 ---
 
@@ -94,7 +95,7 @@ SceneTrace AI transforms recorded videos into searchable visual evidence by allo
 
 ### Prerequisites
 
-- **Python 3.10+** with: torch, opencv-python, transformers, faiss-cpu, fastapi, uvicorn, numpy, Pillow, python-multipart, python-dotenv, httpx, pytest
+- **Python 3.10+** with: torch, opencv-python, transformers, faiss-cpu, fastapi, uvicorn, numpy, Pillow, python-multipart, python-dotenv, httpx, pytest, ultralytics
 - **Node.js 18+** with npm
 - **CUDA-capable GPU** recommended (falls back to CPU)
 
@@ -128,12 +129,11 @@ npm run dev
 
 **Unit tests (no server needed):**
 ```powershell
-cd backend
-python -m pytest tests/ -v
+python -m pytest backend\tests\ -v
 # 37 tests covering pipeline, search, benchmark, config, and API
 ```
 
-> Optional: copy `backend/.env.example` to `backend/.env` to customize CORS origins, upload size limit, etc.
+> Optional: copy `backend/.env.example` to `backend/.env` to customize detector backend, CORS origins, upload size limit, etc.
 
 ---
 
@@ -157,6 +157,15 @@ python -m pytest tests/ -v
    - Visual timeline with motion score markers
    - Keyframe thumbnail grid
 
+### Detector Backend Configuration
+
+The system defaults to **YOLO-World-L** for zero-shot object detection. To switch to **Grounding DINO**, set in `.env`:
+```
+DETECTOR_BACKEND=grounding_dino
+```
+
+YOLO-World automatically falls back through Medium → Small if the Large variant fails due to OOM, timeout, or any runtime error. All fallbacks are logged and transparent to the user.
+
 ### Time Estimates
 
 | Video | Frames | Motion Scan | CLIP Embed | Total Index |
@@ -173,11 +182,11 @@ First index is slowest — CLIP model (~600MB) loads into GPU memory on first re
 
 ### 5.1 Motion-Guided Sparse Sampling
 
-Scans video frames using frame differencing (default, 3-5× faster) or Farneback optical flow to detect motion, keeping only frames with significant activity.
+Scans video frames using frame differencing (default, 3-5x faster) or Farneback optical flow to detect motion, keeping only frames with significant activity.
 
 ```
 For each stride-sampled frame (every 3rd frame):
-  1. Downscale to 160×90 grayscale (4× fewer pixels)
+  1. Downscale to 160x90 grayscale (4x fewer pixels)
   2. Compute motion score via frame differencing or Farneback
   3. Sum flow magnitude → motion score
   4. After full scan: compute percentile threshold (keeps top ~5%)
@@ -185,11 +194,11 @@ For each stride-sampled frame (every 3rd frame):
 ```
 
 **Optimizations:**
-- **Frame differencing**: 3-5× faster than Farneback, equivalent keyframe quality
+- **Frame differencing**: 3-5x faster than Farneback, equivalent keyframe quality
 - **Stride=3**: 66% fewer computations
-- **160×90 resolution**: 4× fewer pixels vs 320×180
+- **160x90 resolution**: 4x fewer pixels vs 320x180
 - **Adaptive percentile**: No manual threshold tuning needed
-- **Parallel extraction**: 3-4× faster than sequential
+- **Parallel extraction**: 3-4x faster than sequential
 
 ### 5.2 CLIP Embedding Generation
 
@@ -231,7 +240,7 @@ Each update includes `stage`, `percent`, `message` (human-readable stage descrip
 
 ### 5.6 Persistence
 
-After indexing, the full `VideoIndex` dataclass (frame_indices, timestamps, embeddings, motion_scores, total_frames) is serialized to `storage/frames/{video_id}/index.json`. On server startup, the lifespan handler reloads all saved indexes from disk.
+After indexing, the full `VideoIndex` dataclass (frame_indices, timestamps, embeddings, motion_scores, total_frames) is serialized to `storage/frames/{video_id}/index.json`. The FAISS index is saved to `storage/frames/{video_id}/index.faiss`. On server startup, the lifespan handler reloads all saved indexes from disk.
 
 ---
 
@@ -255,8 +264,6 @@ All endpoints are prefixed with `/api`. The frontend Vite dev server proxies `/a
 | GET | `/api/clips/{id}` | Download clip | query: `start_frame, end_frame` | MP4 file |
 | GET | `/api/reports/{id}` | Generate report | — | `{video_id, keyframes_count, frame_reduction_pct}` |
 | GET | `/api/metrics` | Basic metrics | — | `{videos_indexed, total_keyframes}` |
-| GET | `/api/frames/{id}/frame_{n}.jpg` | Thumbnail | — | JPEG image |
-| GET | `/api/frames/{id}/frame_{n}_d.jpg` | Annotated thumbnail | — | JPEG image (with bounding boxes) |
 
 ---
 
@@ -266,23 +273,24 @@ All endpoints are prefixed with `/api`. The frontend Vite dev server proxies `/a
 
 | Area | Before | After | Speedup |
 |------|--------|-------|---------|
-| Motion scan | Farneback only | Frame differencing (default) + Farneback opt-in | 3-5× faster |
-| Motion scan resolution | 320×180 (57,600 px) | 160×90 (14,400 px) | 4× fewer pixels |
+| Motion scan | Farneback only | Frame differencing (default) + Farneback opt-in | 3-5x faster |
+| Motion scan resolution | 320x180 (57,600 px) | 160x90 (14,400 px) | 4x fewer pixels |
 | Flow computation | Every frame | Every 3rd frame (stride=3) | 66% fewer computations |
 | Frame selection | Fixed threshold (0.3) | Adaptive percentile (top 5%) | No manual tuning |
-| Frame extraction | Single-threaded sequential | 4 threads parallel | 3-4× faster |
-| CLIP inference | Unbatched | Batch size 32 | Up to 32× throughput |
+| Frame extraction | Single-threaded sequential | 4 threads parallel | 3-4x faster |
+| CLIP inference | Unbatched | Batch size 32 | Up to 32x throughput |
 | FAISS index build | Per-query rebuild | Pre-built once during indexing | ~50ms → ~1ms per query |
-| Thumbnail saving | Sequential loop | ThreadPoolExecutor.map | 4× faster |
+| Thumbnail saving | Sequential loop | ThreadPoolExecutor.map | 4x faster |
 | Model inference | `@torch.no_grad()` | `@torch.inference_mode()` | 2-5% faster |
 
 ### Enhanced Search Optimizations
 
 | Area | Technique | Benefit |
 |------|-----------|---------|
-| Object detection | Grounding DINO on middle frame of each segment only | Avoids running on all frames — constant cost per query |
+| Object detection | YOLO-World-L on middle frame of each segment only | Avoids running on all frames — constant cost per query |
 | Detection caching | Results cached per `(video_id, frame_index)` across queries | Repeated queries hit cache instantly |
-| Lazy model loading | Grounding DINO loads on first search, not at server start | Zero memory cost until detection is actually used |
+| Lazy model loading | YOLO-World loads on first search, not at server start | Zero memory cost until detection is actually used |
+| Auto fallback | YOLO-World-L → M → S on failure | No user intervention needed on OOM/error |
 | Weighted scoring | 55% CLIP + 45% object match | Better ranking without increasing latency |
 | Benchmark tracking | Thread-safe singleton with lock-free reads | Zero overhead for metrics collection |
 
@@ -329,17 +337,18 @@ The CLIP embedding stage is the dominant bottleneck for long videos. It scales l
 
 ```
 AUTOMATE/
-├── .gitignore                # Excludes videos, node_modules, __pycache__, storage, venv
+├── .gitignore
 ├── backend/
 │   ├── main.py              # FastAPI server (16 endpoints + security + async indexing)
 │   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, extraction, progress, benchmarks)
 │   ├── search_engine.py     # Enhanced search: detection integration + weighted scoring + suggestions
-│   ├── detector.py          # Grounding DINO zero-shot object detection (lazy-loaded, GPU)
-│   ├── benchmark.py         # Thread-safe performance metrics singleton
-│   ├── config.py            # Environment-based configuration (.env support)
+│   ├── detector.py          # YOLO-World (L→M→S fallback) + Grounding DINO (lazy-loaded, GPU)
+│   ├── config.py            # Environment config + BenchmarkStats singleton
+│   ├── preload_models.py    # Pre-download all ML models (CLIP, YOLO-World, DINO)
 │   ├── requirements.txt     # Pinned Python dependencies
 │   ├── pytest.ini           # Test configuration
 │   ├── .env.example         # Environment variable template
+│   ├── checkpoints/         # Downloaded model weight files
 │   ├── tests/               # 37 pytest tests (unit + API)
 │   │   ├── test_pipeline.py
 │   │   ├── test_search.py
@@ -386,12 +395,12 @@ AUTOMATE/
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `backend/detector.py` | ~65 | Grounding DINO wrapper: lazy-loaded, `detect()` + `render()` for bboxes |
-| `backend/search_engine.py` | ~130 | Enhanced search: CLIP + detection integration, weighted scoring, suggestions |
-| `backend/benchmark.py` | ~72 | Thread-safe metrics singleton: index speed, query latency, GPU tracking |
-| `backend/config.py` | ~15 | Environment-based configuration with `.env` support |
-| `backend/pipeline.py` | ~300 | Core CV pipeline: motion, CLIP, FAISS, extraction, progress, metadata, benchmarks |
-| `backend/main.py` | ~260 | FastAPI app: 16 endpoints, security hardening, async index, v2 search, dashboard |
+| `backend/detector.py` | ~185 | YOLO-World-L (→M→S fallback) + Grounding DINO: lazy-loaded, `detect()` + `render()` for bboxes |
+| `backend/search_engine.py` | ~134 | Enhanced search: CLIP + detection integration, weighted scoring, suggestions |
+| `backend/config.py` | ~120 | Environment-based config + BenchmarkStats singleton (merged from benchmark.py) |
+| `backend/preload_models.py` | ~65 | Pre-download all models (CLIP, YOLO-World, Grounding DINO) |
+| `backend/pipeline.py` | ~346 | Core CV pipeline: motion, CLIP, FAISS, extraction, progress, metadata, benchmarks |
+| `backend/main.py` | ~369 | FastAPI app: 16 endpoints, security hardening, async index, v2 search, dashboard |
 | `frontend/src/App.jsx` | ~90 | App shell — imports 8 components + 2 hooks |
 | `backend/tests/` | 5 files | 37 pytest tests (unit + API) covering all modules |
 | `test_workflow.ps1` | ~120 | 12-step automated test suite covering all endpoints |
@@ -404,17 +413,17 @@ AUTOMATE/
 |--------|---------------|--------|
 | Frame reduction (5s video) | 53-63% | Adaptive percentile motion sampling |
 | Frame reduction (8min video) | ~97% | Same — longer video has more static frames |
-| Motion scan speed | ~30s for 14K frames | 160×90 gray, stride=3, 200+ FPS effective |
+| Motion scan speed | ~30s for 14K frames | 160x90 gray, stride=3, 200+ FPS effective |
 | CLIP embedding throughput | ~300 frames/min | Batch size 32 on GPU |
 | Query latency (v1) | < 5s | CLIP text embed + FAISS IVFFlat search |
-| Enhanced search latency (w/ detection) | < 10s | v2 search with Grounding DINO on top-K segments |
+| Enhanced search latency (w/ detection) | < 10s | v2 search with YOLO-World on top-K segments |
 | Indexing speed | ~28 FPS | Real-time benchmark from dashboard metrics |
 | Weighted scoring accuracy | 55% semantic + 45% object | Score breakdown per result |
-| Object detection | Arbitrary text queries | Grounding DINO zero-shot (no training) |
+| Object detection | Arbitrary text queries | YOLO-World-L zero-shot (no training) |
 | Dashboard metrics | Live | Indexing speed, query latency, GPU, uptime |
 | Format support | mp4, avi, mov, mkv, webm | OpenCV VideoCapture codec support |
 | No-match rejection | Confidence-gated | Thresholds: high > 0.25, medium > 0.15 |
-| Index persistence | Survives restarts | JSON → lifespan handler reload |
+| Index persistence | Survives restarts | JSON + FAISS binary → lifespan handler reload |
 | Max video tested | 8 min (177 MB, 4K) | 14,400 frames, ~400 keyframes retained |
 
 ---
@@ -423,11 +432,13 @@ AUTOMATE/
 
 | Feature | Status | Effort | Impact |
 |---------|--------|--------|--------|
+| ~~YOLO-World detection with fallback~~ | ✅ DONE | High | Unlimited object classes via YOLO-World-L (→M→S fallback) |
 | ~~Open-vocabulary detection~~ | ✅ DONE | High | Unlimited object classes via Grounding DINO |
 | Weighted explainable scoring | ✅ DONE | Medium | Score breakdown: 55% semantic + 45% object |
 | Performance dashboard | ✅ DONE | Low | Real-time indexing speed, latency, GPU, reduction |
 | Event timeline | ✅ DONE | Medium | Per-video frame timeline with motion scores |
 | Search suggestions | ✅ DONE | Low | Autocomplete based on query patterns |
+| Preload scripts for all models | ✅ DONE | Low | `python preload_models.py` downloads everything |
 | Multi-object tracking (ByteTrack) | ❌ FUTURE | High | Eliminates single-frame false positives |
 | Action recognition (X-CLIP) | ❌ FUTURE | Medium | Event-level understanding |
 | Speech-to-text search (Whisper) | ❌ FUTURE | Low | Search by spoken content |

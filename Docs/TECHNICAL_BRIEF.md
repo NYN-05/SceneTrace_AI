@@ -62,12 +62,13 @@ A system that:
                └────────────┘                    └─────────────────────┘
 
                      QUERY PIPELINE
-┌──────────┐     ┌────────────────┐    ┌───────────┐    ┌────────────────┐
-│  User    │────▶│  CLIP Text     │───▶│  FAISS    │───▶│  Segment       │
-│  Query   │     │  Embedding     │    │  Search   │    │  Clustering    │
-│ (English)│     └────────────────┘    └───────────┘    │  + Confidence  │
-└──────────┘                                           │  Gating        │
-                                                        └───────┬────────┘
+┌──────────┐     ┌────────────────┐    ┌───────────┐    ┌──────────────────────┐
+│  User    │────▶│  CLIP Text     │───▶│  FAISS    │───▶│  YOLO-World-L       │
+│  Query   │     │  Embedding     │    │  Search   │    │  (auto fallback     │
+│ (English)│     └────────────────┘    └───────────┘    │   M → S) +          │
+└──────────┘                                           │  Segment Clustering │
+                                                        │  + Confidence Gating│
+                                                        └───────┬──────────────┘
                                                                 │
                                                      ┌──────────▼────────┐
                                                      │  Result Cards     │
@@ -82,16 +83,18 @@ A system that:
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | **Vision-language model** | CLIP ViT-B/32 (OpenAI) | Zero-shot semantic understanding — no fine-tuning required |
-| **Motion sampling** | Frame differencing (default) or Farneback | Diff is 3-5× faster with equivalent keyframe quality |
+| **Open-vocab detector** | YOLO-World-L (→M→S fallback) + Grounding DINO opt-in | YOLO-World is 3-9x faster than DINO with higher AP; auto fallback on OOM/error |
+| **Motion sampling** | Frame differencing (default) or Farneback | Diff is 3-5x faster with equivalent keyframe quality |
 | **Frame stride** | Every 3rd frame | 66% fewer flow computations with negligible accuracy loss |
-| **Parallel extraction** | ThreadPoolExecutor (4 workers) | 3–4× faster than sequential frame reading |
+| **Parallel extraction** | ThreadPoolExecutor (4 workers) | 3-4x faster than sequential frame reading |
 | **Vector index** | FAISS IVFFlat (or FlatIP for <50 vectors) | O(log n) approximate search at 100K+ vectors; pre-built once during indexing, not per query |
-| **CLIP batching** | 32 frames per batch | Maximizes GPU utilization; up to 32× throughput vs. single-image |
+| **CLIP batching** | 32 frames per batch | Maximizes GPU utilization; up to 32x throughput vs. single-image |
 | **Async indexing** | Background thread via ThreadPoolExecutor | `/index` returns immediately; frontend polls progress endpoint |
 | **Progress tracking** | Shared dict updated per stage/batch | Real-time `{stage, percent, message, eta_seconds}` — no WebSocket needed |
 | **Index persistence** | JSON + FAISS binary serialization | Survives server restarts — no re-indexing needed |
 | **FAISS pre-build** | Built once during `index_video`, saved to `.faiss` file | Eliminates O(n·d) rebuild cost per query — search drops from ~50ms to ~1ms |
 | **Confidence gating** | HIGH > 0.25, MEDIUM > 0.15, LOW < 0.15 | Prevents false positives from weak semantic matches |
+| **Model preloading** | `preload_models.py` downloads all models | Models cached on disk before first run — avoids runtime download latency |
 
 ---
 
@@ -104,7 +107,7 @@ All measurements taken on a consumer laptop with CUDA GPU. Times are wall-clock,
 | Stage | Time | Efficiency |
 |-------|------|-----------|
 | Motion scan (stride=3, 160×90) | < 1 s | 200+ FPS effective throughput |
-| Frame extraction (56 keyframes, 4 threads) | < 1 s | 3× faster than sequential |
+| Frame extraction (56 keyframes, 4 threads) | < 1 s | 3x faster than sequential |
 | CLIP embedding (batch size 32, GPU) | ~13 s | Core bottleneck — scales linearly with keyframes |
 | FAISS index build | < 0.5 s | Pre-built once, eliminates rebuild on each query |
 | **Total index time** | **~13.4 s** | |
@@ -119,8 +122,8 @@ All measurements taken on a consumer laptop with CUDA GPU. Times are wall-clock,
 | Total frames | 14,400 |
 | Keyframes retained | ~400 |
 | Frame reduction | **97%** |
-| Estimated motion scan | ~30–60 s |
-| Estimated total index | ~3–6 min |
+| Estimated motion scan | ~30-60 s |
+| Estimated total index | ~3-6 min |
 | Manual review equivalent | **8 minutes** → **seconds of search** |
 
 ### Frame Reduction Scaling
@@ -130,7 +133,7 @@ Frames retained after motion sampling (target_pct = 5%):
 
 Short video (5s)    62.7% reduction       Reason: high motion-to-static ratio
 Medium video (8min)  ~97% reduction       Reason: long static intervals
-Long video (30min)   ~97–99% reduction    Reason: even higher static ratio
+Long video (30min)   ~97-99% reduction    Reason: even higher static ratio
 ```
 
 The adaptive percentile threshold automatically adjusts: high-motion videos retain more frames, surveillance footage with long static intervals retains far fewer.
@@ -159,8 +162,8 @@ The problem requires:
 | **Text description input** | Any natural language query — single words, full sentences, with optional time ranges |
 | **Semantic search** | CLIP encodes both query and frames into a shared 512-dim space — matches by *concept*, not keyword |
 | **Retrieve matching clips** | FAISS search → segment clustering → downloadable MP4 clip with precise start/end |
-| **Recorded video archives** | Local storage with JSON persistence — indexes survive restarts, no cloud dependency |
-| **NLP + vision-language models** | CLIP ViT-B/32 (HuggingFace Transformers) for both text and image encoding |
+| **Recorded video archives** | Local storage with JSON + FAISS persistence — indexes survive restarts, no cloud dependency |
+| **NLP + vision-language models** | CLIP ViT-B/32 for text+image encoding, YOLO-World-L for open-vocab detection |
 | **Live and practical** | Processes real uploaded videos on consumer hardware — not a canned demo |
 
 ---
@@ -169,13 +172,14 @@ The problem requires:
 
 **This is not a slideshow or a mockup.** The system is running on this machine at this moment:
 
-- **Backend API:** `http://localhost:8000` (FastAPI, 10 endpoints)
+- **Backend API:** `http://localhost:8000` (FastAPI, 16 endpoints)
 - **Frontend UI:** `http://localhost:5173` (React + Vite + Tailwind)
 - **Live progress bar:** Real-time stage, percentage, and ETA displayed during indexing via polling
-- **GPU:** CUDA-enabled CLIP inference
+- **GPU:** CUDA-enabled CLIP and YOLO-World inference
 - **Storage:** Local filesystem — videos, keyframes, indexes, and clips
+- **Detector fallback:** YOLO-World-L → Medium → Small on any failure; Grounding DINO via env var
 
-A judge can walk up, upload any `.mp4` file, type any English description, and receive matching segments in real time. The 7-step automated test suite (`test_workflow.ps1`) independently validates the entire pipeline end-to-end.
+A judge can walk up, upload any `.mp4` file, type any English description, and receive matching segments in real time. The 12-step automated test suite (`test_workflow.ps1`) independently validates the entire pipeline end-to-end.
 
 ---
 
@@ -183,7 +187,8 @@ A judge can walk up, upload any `.mp4` file, type any English description, and r
 
 | Enhancement | Effort | Impact |
 |------------|--------|--------|
-| Open-vocabulary detection (Grounding DINO) | High | Unlimited object classes with bounding boxes |
+| Open-vocabulary detection | ✅ DONE — YOLO-World-L + Grounding DINO | Unlimited object classes with bounding boxes |
+| Model preloading script | ✅ DONE — `preload_models.py` | Download all models before first run |
 | Multi-object tracking (ByteTrack) | High | Eliminates single-frame false positives |
 | Speech-to-text search (Whisper) | Medium | Search by spoken content in videos |
 | Cross-camera search | Medium | Multi-camera investigation workflows |

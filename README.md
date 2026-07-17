@@ -10,6 +10,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)](https://react.dev)
 [![CLIP](https://img.shields.io/badge/CLIP-ViT--B/32-FF6F00?logo=openai&logoColor=white)](https://openai.com/research/clip)
+[![YOLO-World](https://img.shields.io/badge/YOLO--World-Large-00C853?logo=ultralytics&logoColor=white)](https://docs.ultralytics.com/models/yolo-world)
 [![FAISS](https://img.shields.io/badge/FAISS-IVFFlat-512BD4?logo=meta&logoColor=white)](https://faiss.ai)
 [![Grounding DINO](https://img.shields.io/badge/GroundingDINO-ZeroShot-22c55e?logo=huggingface&logoColor=white)](https://huggingface.co/IDEA-Research/grounding-dino-base)
 [![GPU](https://img.shields.io/badge/GPU-CUDA-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda)
@@ -56,12 +57,13 @@ Open **http://localhost:5173** → Upload `.mp4` → Type any query → Get resu
 
 ```
                     INDEXING                           ENHANCED SEARCH
-┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌────────────┐   ┌────────────────┐
-│  Upload  │──▶│  Motion      │──▶│  CLIP    │──▶│  FAISS     │──▶│  Zero-Shot     │
-│  Video   │   │  Sampling    │   │  Embed   │   │  Search    │   │  Detection     │
-│          │   │  (160×90,    │   │  (GPU    │   │  (IVF      │   │  (Grounding    │
-│          │   │   stride=3)  │   │  batch32)│   │  FlatIP)   │   │   DINO)        │
-└──────────┘   └──────┬───────┘   └──────────┘   └─────┬──────┘   └───────┬────────┘
+┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌────────────┐   ┌──────────────────────┐
+│  Upload  │──▶│  Motion      │──▶│  CLIP    │──▶│  FAISS     │──▶│  Zero-Shot           │
+│  Video   │   │  Sampling    │   │  Embed   │   │  Search    │   │  Detection           │
+│          │   │  (160×90,    │   │  (GPU    │   │  (IVF      │   │  (YOLO-World-L,       │
+│          │   │   stride=3)  │   │  batch32)│   │  FlatIP)   │   │   auto fallback      │
+│          │   │              │   │          │   │            │   │   M → S)             │
+└──────────┘   └──────┬───────┘   └──────────┘   └─────┬──────┘   └───────┬──────────────┘
                       │                                 │                 │
                       ▼                                 ▼                 ▼
                ┌────────────┐                    ┌──────────┐     ┌──────────────┐
@@ -79,23 +81,23 @@ Open **http://localhost:5173** → Upload `.mp4` → Type any query → Get resu
 ```
 
 ### 1️⃣ Motion-Guided Sampling
-Frame differencing (default) or Farneback optical flow at **160×90** resolution, every **3rd frame**, adaptive percentile threshold. Keeps only the **~5% most active frames** — **up to 97% reduction** on surveillance footage. Frame differencing is **3-5× faster** than Farneback with equivalent keyframe quality.
+Frame differencing (default) or Farneback optical flow at **160×90** resolution, every **3rd frame**, adaptive percentile threshold. Keeps only the **~5% most active frames** — **up to 97% reduction** on surveillance footage.
 
 ### 2️⃣ CLIP Embeddings
-Each keyframe → 512-dim vector via `openai/clip-vit-base-patch32`. The user's query goes through the same text encoder. Both live in the **same semantic space** — understands concepts, not keywords.
+Each keyframe → 512-dim vector via `openai/clip-vit-base-patch32`. The user's query goes through the same text encoder. Both live in the **same semantic space**.
 
 ### 3️⃣ FAISS Vector Search
 Milliseconds to search. IVFFlat for large indexes, FlatIP fallback for small ones. Results clustered into coherent segments by frame-index proximity.
 
 ### ⏳ Live Progress Tracking
-Indexing runs **asynchronously in a background thread** — the UI polls `GET /api/videos/{id}/index-progress` every 800ms and displays a real-time progress bar with **stage name** (motion scan → extract → embed → save), **percentage**, and **ETA**.
+Indexing runs **asynchronously in a background thread** — the UI polls `GET /api/videos/{id}/index-progress` every 800ms.
 
 ### 4️⃣ Zero-Shot Object Detection
-After retrieving candidate frames, **Grounding DINO** runs open-vocabulary detection on the middle frame of each segment. Detects arbitrary objects described in the query — *"backpack"*, *"red car"*, *"helmet"* — without any training. Bounding boxes rendered on thumbnails.
+**YOLO-World-L** (default) runs open-vocabulary detection on candidate frames. If inference fails, the system automatically falls back to **YOLO-World-M → YOLO-World-S** without user intervention. Can also use **Grounding DINO** via `DETECTOR_BACKEND=grounding_dino`.
 
 ### 5️⃣ Weighted Scoring + Explanation
 **Overall Score = 55% Semantic Similarity + 45% Object Match**
-Every result shows a score breakdown: semantic match, object match, tracking consistency, and temporal alignment. An **Explanation Panel** tells the user *why* each clip matched.
+Every result shows a score breakdown with an **Explanation Panel**.
 
 ### 6️⃣ Confidence Gating
 | Level | Threshold | Behavior |
@@ -127,12 +129,12 @@ Every result shows a score breakdown: semantic match, object match, tracking con
 | Layer | Technology | Why |
 |-------|-----------|-----|
 | **Vision-Language** | CLIP ViT-B/32 | Zero-shot semantic understanding |
-| **Open-Vocab Detection** | Grounding DINO | Detect any object from query text |
+| **Open-Vocab Detection** | YOLO-World-L (→M→S fallback) + Grounding DINO | Detect any object from query text |
 | **Motion Analysis** | OpenCV Farneback (160×90) | 200+ FPS flow computation |
 | **Vector Search** | FAISS (IVFFlat) | O(log n) at 100K+ vectors |
 | **Backend** | FastAPI + ThreadPoolExecutor | Async endpoints, CPU offload, metrics |
 | **Frontend** | React 18 + Vite + Tailwind | Google-like search, dashboard, timeline |
-| **Storage** | Local filesystem (JSON) | Index persistence across restarts |
+| **Storage** | Local filesystem (JSON + FAISS binary) | Index persistence across restarts |
 
 ---
 
@@ -160,17 +162,18 @@ Every result shows a score breakdown: semantic match, object match, tracking con
 ## 📁 Project Structure
 
 ```
-├── .gitignore                # Excludes videos, node_modules, storage, venv
+├── .gitignore
 ├── backend/
 │   ├── main.py              # FastAPI server (16 endpoints + security + async indexing)
 │   ├── pipeline.py          # CV pipeline (motion, CLIP, FAISS, extraction, progress)
 │   ├── search_engine.py     # Enhanced search: detection + weighted scoring + suggestions
-│   ├── detector.py          # Grounding DINO zero-shot object detection (lazy-loaded)
-│   ├── benchmark.py         # Thread-safe performance metrics tracking
-│   ├── config.py            # Environment-based configuration (.env)
+│   ├── detector.py          # YOLO-World (L→M→S fallback) + Grounding DINO (lazy-loaded)
+│   ├── config.py            # Environment config + BenchmarkStats singleton
+│   ├── preload_models.py    # Pre-download all ML models (CLIP, YOLO-World, DINO)
 │   ├── requirements.txt     # Pinned Python dependencies
 │   ├── pytest.ini           # Test configuration
 │   ├── .env.example         # Environment variable template
+│   ├── checkpoints/         # Downloaded model weight files
 │   ├── tests/               # 37 pytest tests (unit + API)
 │   │   ├── test_pipeline.py
 │   │   ├── test_search.py
@@ -208,7 +211,10 @@ Every result shows a score breakdown: semantic match, object match, tracking con
 ## 🧪 Running Tests
 
 ```powershell
-# Unit + API tests (no server needed)
+# Unit + API tests (no server needed) — from root
+python -m pytest backend\tests\ -v
+
+# Or from the backend directory
 cd backend; python -m pytest tests/ -v
 
 # End-to-end integration (servers must be running)
@@ -223,13 +229,13 @@ End-to-end `test_workflow.ps1` validates: health → upload → index (progress 
 
 ## 🏆 Why It Wins
 
-- **✅ Zero-shot detection** — Grounding DINO localizes any object in the query on result thumbnails. No training needed.
+- **✅ YOLO-World with auto fallback** — YOLO-World-L (default) with seamless fallback to Medium → Small on failure. Zero-shot object detection on any query term. Grounding DINO also available.
 - **✅ Explainable AI** — Every result shows a score breakdown (semantic, object, tracking, temporal) with a "Why this matched" explanation panel.
 - **✅ Google-like UX** — Rich search cards, autocomplete suggestions, score breakdown bars, dashboard metrics, event timeline.
 - **✅ Performance dashboard** — Real-time metrics: indexing speed (fps), avg query latency, frame reduction %, GPU status.
 - **✅ Fully working end-to-end** — Not a prototype. Upload any `.mp4`, type any query, get results with bounding boxes.
 - **✅ Live demo** — Running on this machine at `localhost:5173`. Judges can test it in 30 seconds.
-- **✅ No cloud dependency** — All on-device (CLIP, FAISS, Grounding DINO, FastAPI). Private, free, offline-capable.
+- **✅ No cloud dependency** — All on-device (CLIP, FAISS, YOLO-World, FastAPI). Private, free, offline-capable.
 - **✅ Semantic understanding** — CLIP matches by concept, not keyword. "Red jacket" works in any lighting, any angle.
 - **✅ Optimized for real footage** — 97% frame reduction, ~5s query time, async indexing with progress bar.
 

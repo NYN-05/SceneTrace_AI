@@ -11,12 +11,12 @@
 3. [Phase 2 — Object Intelligence](#3-phase-2--object-intelligence)
 4. [Phase 3 — Semantic Understanding](#4-phase-3--semantic-understanding)
 5. [Phase 4 — Temporal Reasoning](#5-phase-4--temporal-reasoning)
-6. [Phase 5 — Hybrid Retrieval & Reranking](#6-phase-5--hybrid-retrieval--reranking)
+6. [Phase 5 — Hybrid Retrieval &amp; Reranking](#6-phase-5--hybrid-retrieval--reranking)
 7. [Target Pipeline](#7-target-pipeline)
 8. [Query Breakdown Examples](#8-query-breakdown-examples)
 9. [Recommended Models](#9-recommended-models)
 10. [Expected Improvements](#10-expected-improvements)
-11. [Dependency & Cost Analysis](#11-dependency--cost-analysis)
+11. [Dependency &amp; Cost Analysis](#11-dependency--cost-analysis)
 
 ---
 
@@ -44,13 +44,13 @@ Return segments
 
 ### Root Cause of "Same Frames for Every Query"
 
-| Problem | Why It Happens | Severity |
-|---------|---------------|----------|
-| **CLIP encodes the whole frame** | Query for "traffic light" and "car" both match the same scene vector | 🔴 Critical |
-| **Detection runs after search** | Objects never enter the index — only frame embeddings are compared | 🔴 Critical |
-| **No object tracking** | Each frame is independent — "show the white car" returns random frames of any car | 🔴 Critical |
-| **No temporal embeddings** | Action queries like "crossing road" can't be expressed in a single frame | 🟡 Major |
-| **No hybrid scoring** | Pure embedding similarity misses structured filters (class, motion, location) | 🟡 Major |
+| Problem                                | Why It Happens                                                                     | Severity    |
+| -------------------------------------- | ---------------------------------------------------------------------------------- | ----------- |
+| **CLIP encodes the whole frame** | Query for "traffic light" and "car" both match the same scene vector               | 🔴 Critical |
+| **Detection runs after search**  | Objects never enter the index — only frame embeddings are compared                | 🔴 Critical |
+| **No object tracking**           | Each frame is independent — "show the white car" returns random frames of any car | 🔴 Critical |
+| **No temporal embeddings**       | Action queries like "crossing road" can't be expressed in a single frame           | 🟡 Major    |
+| **No hybrid scoring**            | Pure embedding similarity misses structured filters (class, motion, location)      | 🟡 Major    |
 
 ---
 
@@ -59,6 +59,7 @@ Return segments
 > **Priority:** ⭐⭐⭐⭐⭐ | **Effort:** Medium | **Impact:** High
 
 ### Goal
+
 Replace the frame-level-only index with an **object-aware index** that stores per-object embeddings alongside per-frame embeddings.
 
 ### Implementation
@@ -102,6 +103,7 @@ def _index_frame_objects(frame: np.ndarray, frame_idx: int, video_id: str):
 ```
 
 **New `pipeline.py` changes:**
+
 - Add `INDEX_DETECTION_PROMPTS` to config (default: common categories)
 - Add `embed_image()` function for single-image CLIP encoding
 - Add `object_index` alongside the existing `embedding_index` in `VideoIndex`
@@ -172,6 +174,7 @@ INDEX_OBJECT_CONFIDENCE: float = float(os.getenv("INDEX_OBJECT_CONFIDENCE", "0.3
 > **Priority:** ⭐⭐⭐⭐⭐ | **Effort:** High | **Impact:** Very High
 
 ### Goal
+
 Add **multi-object tracking** across frames so queries return entire trajectories (not scattered single frames).
 
 ### Implementation
@@ -181,6 +184,7 @@ Add **multi-object tracking** across frames so queries return entire trajectorie
 ByteTrack is a simple, high-performance tracker that assigns consistent IDs to objects across frames using IoU + confidence-based association.
 
 **Installation:**
+
 ```bash
 pip install bytetrack
 # OR use the standalone implementation:
@@ -339,6 +343,7 @@ def search_relationship(obj_a: str, obj_b: str, video_id: str,
 > **Priority:** ⭐⭐⭐⭐☆ | **Effort:** High | **Impact:** High
 
 ### Goal
+
 Add **scene captioning** and **LLM-based query parsing** so the system understands natural language intent rather than doing raw embedding comparison.
 
 ### Implementation
@@ -532,6 +537,7 @@ def parse_query_simple(query: str) -> dict:
 > **Priority:** ⭐⭐⭐⭐⭐ | **Effort:** High | **Impact:** Very High
 
 ### Goal
+
 Answer **action queries** ("crossing the road", "walking toward camera") by indexing short video clips rather than isolated frames and using motion features + track trajectories.
 
 ### Implementation
@@ -654,6 +660,7 @@ def segment_by_action(tracks: list, action: str, video_fps: int) -> list:
 > **Priority:** ⭐⭐⭐⭐⭐ | **Effort:** Medium | **Impact:** Very High
 
 ### Goal
+
 Replace single-stage FAISS search with a **multi-stage pipeline**: broad retrieval → structured filtering → cross-encoder reranking.
 
 ### Implementation
@@ -727,6 +734,7 @@ Return final results
 #### 6.3 Cross-Encoder Reranking
 
 Install:
+
 ```bash
 pip install sentence-transformers
 ```
@@ -938,32 +946,33 @@ LLM Parse → {
 
 ## 9. Recommended Models
 
-| Task | Recommended Model | Size | VRAM | Speed | Alternative (Lighter) |
-|------|------------------|------|------|-------|----------------------|
-| **Object Detection** | YOLOv11x | ~350MB | 4-6 GB | Very Fast | YOLOv11m (~200MB) |
-| **Open-Vocab Detection** | Grounding DINO 1.5 | ~1.5GB | 4-6 GB | Slow | YOLO-World-L (already integrated) |
-| **Segmentation** | SAM2 | ~2.5GB | 6-8 GB | Medium | SAM2-Tiny (~500MB) |
-| **Object Tracking** | ByteTrack | ~0MB | 0 GB | Very Fast | (None needed) |
-| **Image Embedding** | SigLIP2 ViT-L/14 | ~1.5GB | 3-4 GB | Fast | CLIP ViT-B/32 (already integrated) |
-| **Caption Generation** | Florence-2-Large | ~1.8GB | 4-6 GB | Slow | BLIP-2 Flan-T5-XL (~3GB) |
-| **Caption Gen (Lighter)** | Florence-2-Base | ~800MB | 2-3 GB | Medium | |
-| **Video Understanding** | InternVideo2 | ~2.5GB | 6-8 GB | Medium | Frame averaging (no extra model) |
-| **Reranking** | BAAI BGE-Reranker-v2 | ~1.0GB | 2-3 GB | Medium | Cross-encoder MiniLM (~500MB) |
-| **LLM Query Parser** | Phi-3-Mini-4K | ~2.5GB | 4-6 GB | Fast | Regex parser (no extra model) |
-| **LLM Query (Lighter)** | Llama-3.2-3B | ~2.0GB | 3-4 GB | Fast | |
+| Task                            | Recommended Model    | Size   | VRAM   | Speed     | Alternative (Lighter)              |
+| ------------------------------- | -------------------- | ------ | ------ | --------- | ---------------------------------- |
+| **Object Detection**      | YOLOv11x             | ~350MB | 4-6 GB | Very Fast | YOLOv11m (~200MB)                  |
+| **Open-Vocab Detection**  | Grounding DINO 1.5   | ~1.5GB | 4-6 GB | Slow      | YOLO-World-L (already integrated)  |
+| **Segmentation**          | SAM2                 | ~2.5GB | 6-8 GB | Medium    | SAM2-Tiny (~500MB)                 |
+| **Object Tracking**       | ByteTrack            | ~0MB   | 0 GB   | Very Fast | (None needed)                      |
+| **Image Embedding**       | SigLIP2 ViT-L/14     | ~1.5GB | 3-4 GB | Fast      | CLIP ViT-B/32 (already integrated) |
+| **Caption Generation**    | Florence-2-Large     | ~1.8GB | 4-6 GB | Slow      | BLIP-2 Flan-T5-XL (~3GB)           |
+| **Caption Gen (Lighter)** | Florence-2-Base      | ~800MB | 2-3 GB | Medium    |                                    |
+| **Video Understanding**   | InternVideo2         | ~2.5GB | 6-8 GB | Medium    | Frame averaging (no extra model)   |
+| **Reranking**             | BAAI BGE-Reranker-v2 | ~1.0GB | 2-3 GB | Medium    | Cross-encoder MiniLM (~500MB)      |
+| **LLM Query Parser**      | Phi-3-Mini-4K        | ~2.5GB | 4-6 GB | Fast      | Regex parser (no extra model)      |
+| **LLM Query (Lighter)**   | Llama-3.2-3B         | ~2.0GB | 3-4 GB | Fast      |                                    |
 
 ### Cumulative Memory Budget
 
-| Phase | Additional Models | Peak VRAM | Total VRAM |
-|-------|------------------|-----------|------------|
-| Current | CLIP + YOLO-World-L | ~2 GB | ~2 GB |
-| Phase 1 | (none added) | — | ~2 GB |
-| Phase 2 | ByteTrack (no GPU) | 0 GB | ~2 GB |
-| Phase 3 | Florence-2-L or Phi-3 | ~2-4 GB | ~4-6 GB |
-| Phase 4 | InternVideo2 or VideoMAE | ~3 GB | ~5-7 GB |
-| Phase 5 | BGE-Reranker | ~1 GB | ~5-8 GB |
+| Phase   | Additional Models        | Peak VRAM | Total VRAM |
+| ------- | ------------------------ | --------- | ---------- |
+| Current | CLIP + YOLO-World-L      | ~2 GB     | ~2 GB      |
+| Phase 1 | (none added)             | —        | ~2 GB      |
+| Phase 2 | ByteTrack (no GPU)       | 0 GB      | ~2 GB      |
+| Phase 3 | Florence-2-L or Phi-3    | ~2-4 GB   | ~4-6 GB    |
+| Phase 4 | InternVideo2 or VideoMAE | ~3 GB     | ~5-7 GB    |
+| Phase 5 | BGE-Reranker             | ~1 GB     | ~5-8 GB    |
 
 > **VRAM ceiling:** If using a single 8-12 GB GPU, you cannot load all models simultaneously. Solutions:
+>
 > - **Model swapping:** Load models on demand, unload after use
 > - **CPU inference:** Run captioning/LLM on CPU (slower but viable)
 > - **Batch processing:** Run captioning offline during indexing, not at query time
@@ -975,31 +984,31 @@ LLM Parse → {
 
 ### Per-Phase Accuracy Gains
 
-| Phase | Metric | Before | After | Improvement |
-|-------|--------|--------|-------|-------------|
-| **Phase 1** | Object-level retrieval precision | ~30% | ~65% | 2x |
-| | Distinct results for different object queries | Low | High | — |
-| **Phase 2** | Trajectory completeness | N/A | 90%+ | New capability |
-| | Multi-frame consistency | Low | High | — |
-| **Phase 3** | Natural language understanding | ~50% | ~85% | 1.7x |
-| | Attribute-aware filtering (e.g., "white car") | None | 80%+ | New capability |
-| **Phase 4** | Action query accuracy (crossing, turning) | ~20% | ~75% | 3.7x |
-| | Temporal segmentation quality | Low | High | — |
-| **Phase 5** | Overall ranking quality (nDCG@10) | ~0.4 | ~0.8 | 2x |
-| | False positive reduction | High | Low | — |
+| Phase             | Metric                                        | Before | After | Improvement    |
+| ----------------- | --------------------------------------------- | ------ | ----- | -------------- |
+| **Phase 1** | Object-level retrieval precision              | ~30%   | ~65%  | 2x             |
+|                   | Distinct results for different object queries | Low    | High  | —             |
+| **Phase 2** | Trajectory completeness                       | N/A    | 90%+  | New capability |
+|                   | Multi-frame consistency                       | Low    | High  | —             |
+| **Phase 3** | Natural language understanding                | ~50%   | ~85%  | 1.7x           |
+|                   | Attribute-aware filtering (e.g., "white car") | None   | 80%+  | New capability |
+| **Phase 4** | Action query accuracy (crossing, turning)     | ~20%   | ~75%  | 3.7x           |
+|                   | Temporal segmentation quality                 | Low    | High  | —             |
+| **Phase 5** | Overall ranking quality (nDCG@10)             | ~0.4   | ~0.8  | 2x             |
+|                   | False positive reduction                      | High   | Low   | —             |
 
 ### Final Target Metrics
 
-| Metric | Current | Target |
-|--------|---------|--------|
-| Object retrieval accuracy | ~30-40% | **90-97%** |
-| Natural language understanding | ~50% | **90-95%** |
-| Bounding-box localization | ~70% | **95%+** |
-| Multi-object tracking consistency | N/A | **90%+** |
-| Action query accuracy | ~20% | **80%+** |
-| Query latency (v2 search) | ~5s | **< 8s** (with reranking) |
-| Indexing speed | ~28 FPS | **~20 FPS** (with detection overhead) |
-| Frame reduction | 97% | 95% (more frames indexed) |
+| Metric                            | Current | Target                                      |
+| --------------------------------- | ------- | ------------------------------------------- |
+| Object retrieval accuracy         | ~30-40% | **90-97%**                            |
+| Natural language understanding    | ~50%    | **90-95%**                            |
+| Bounding-box localization         | ~70%    | **95%+**                              |
+| Multi-object tracking consistency | N/A     | **90%+**                              |
+| Action query accuracy             | ~20%    | **80%+**                              |
+| Query latency (v2 search)         | ~5s     | **< 8s** (with reranking)             |
+| Indexing speed                    | ~28 FPS | **~20 FPS** (with detection overhead) |
+| Frame reduction                   | 97%     | 95% (more frames indexed)                   |
 
 ---
 
@@ -1024,32 +1033,33 @@ sentence-transformers>=3.0.0
 
 ### Implementation Order (Recommended)
 
-| Step | Phase | Effort | Risk | Value | Do First? |
-|------|-------|--------|------|-------|-----------|
-| 1 | Phase 1: Object detection during indexing | 2 days | Low | High | ✅ Yes |
-| 2 | Phase 2: ByteTrack integration | 2 days | Low | Very High | ✅ Yes |
-| 3 | Phase 3: Regex query parser (light) | 1 day | Low | Medium | ✅ Yes |
-| 4 | Phase 3: Scene captioning | 3 days | Medium | High | ⬜ After 1-3 |
-| 5 | Phase 3: LLM query parser | 2 days | Medium | High | ⬜ After captioning |
-| 6 | Phase 4: Clip-level indexing | 4 days | High | High | ⬜ Later |
-| 7 | Phase 4: Action query engine | 3 days | High | High | ⬜ With clip indexing |
-| 8 | Phase 5: Hybrid scoring formula | 1 day | Low | High | ✅ Yes (combine with step 1) |
-| 9 | Phase 5: Metadata DB | 2 days | Medium | Medium | ⬜ After step 2 |
-| 10 | Phase 5: Cross-encoder reranking | 1 day | Low | High | ⬜ After hybrid scoring |
+| Step | Phase                                     | Effort | Risk   | Value     | Do First?                      |
+| ---- | ----------------------------------------- | ------ | ------ | --------- | ------------------------------ |
+| 1    | Phase 1: Object detection during indexing | 2 days | Low    | High      | ✅ Yes D                       |
+| 2    | Phase 2: ByteTrack integration            | 2 days | Low    | Very High | ✅ YesD                        |
+| 3    | Phase 3: Regex query parser (light)       | 1 day  | Low    | Medium    | ✅ YesD                        |
+| 4    | Phase 3: Scene captioning                 | 3 days | Medium | High      | ⬜ After 1-3                   |
+| 5    | Phase 3: LLM query parser                 | 2 days | Medium | High      | ⬜ After captioning            |
+| 6    | Phase 4: Clip-level indexing              | 4 days | High   | High      | ⬜ Later                       |
+| 7    | Phase 4: Action query engine              | 3 days | High   | High      | ⬜ With clip indexing          |
+| 8    | Phase 5: Hybrid scoring formula           | 1 day  | Low    | High      | ✅ Yes (combine with step 1) D |
+| 9    | Phase 5: Metadata DB                      | 2 days | Medium | Medium    | ⬜ After step 2D               |
+| 10   | Phase 5: Cross-encoder reranking          | 1 day  | Low    | High      | ⬜ After hybrid scoring D      |
 
 ### Quick Wins (Week 1)
 
 1. **Phase 1 — Object detection during indexing** (2 days)
+
    - Biggest single improvement: queries for different objects return different results
    - Reuses existing YOLO-World-L code
    - No new model downloads
-
 2. **Phase 2 — ByteTrack** (2 days)
+
    - Transforms scattered frames into coherent tracks
    - "Show the white car" becomes meaningful
    - Zero GPU cost
-
 3. **Phase 5 — Hybrid scoring** (1 day)
+
    - Combine existing CLIP + object signals with track consistency
    - Configurable weights → tunable per dataset
 

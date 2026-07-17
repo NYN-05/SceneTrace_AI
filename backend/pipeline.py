@@ -7,6 +7,7 @@ import json
 import re
 import logging
 import threading
+import sqlite3
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -34,6 +35,9 @@ class VideoIndex:
     metadata: dict = field(default_factory=lambda: {"fps": 0, "width": 0, "height": 0, "duration": 0})
     benchmarks: dict = field(default_factory=lambda: {"scan_time": 0, "extract_time": 0, "embed_time": 0, "total_time": 0})
     object_metadata: list[dict] = field(default_factory=list)
+    track_metadata: dict = field(default_factory=dict)
+    captions: dict[int, str] = field(default_factory=dict)
+    clip_indices: list[list[int]] = field(default_factory=list)
 
     def faiss_path(self) -> Path:
         return STORAGE / "frames" / self.video_id / "index.faiss"
@@ -113,6 +117,60 @@ class VideoIndex:
         p.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(p), embeddings)
 
+    def caption_embeddings_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "caption_embeddings.npy"
+
+    def caption_faiss_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "caption_index.faiss"
+
+    def get_caption_faiss_index(self) -> faiss.Index | None:
+        cache_key = f"{self.video_id}_captions"
+        with _faiss_cache_lock:
+            if cache_key in _faiss_index_cache:
+                return _faiss_index_cache[cache_key]
+        p = self.caption_faiss_path()
+        if p.exists():
+            idx = faiss.read_index(str(p))
+            with _faiss_cache_lock:
+                _faiss_index_cache[cache_key] = idx
+            return idx
+        return None
+
+    def save_caption_faiss_index(self, index: faiss.Index):
+        p = self.caption_faiss_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(p))
+        with _faiss_cache_lock:
+            _faiss_index_cache[f"{self.video_id}_captions"] = index
+
+    def load_caption_embeddings(self) -> np.ndarray | None:
+        p = self.caption_embeddings_path()
+        if p.exists():
+            return np.load(str(p)).astype("float32")
+        return None
+
+    def save_caption_embeddings(self, embeddings: np.ndarray):
+        p = self.caption_embeddings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(p), embeddings)
+
+    def clip_embeddings_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "clip_embeddings.npy"
+
+    def load_clip_embeddings(self) -> np.ndarray | None:
+        p = self.clip_embeddings_path()
+        if p.exists():
+            return np.load(str(p)).astype("float32")
+        return None
+
+    def save_clip_embeddings(self, embeddings: np.ndarray):
+        p = self.clip_embeddings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(p), embeddings)
+
+    def metadata_db_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "metadata.db"
+
 from transformers import CLIPModel, CLIPProcessor
 _clip_model = None
 _clip_processor = None
@@ -170,6 +228,233 @@ def embed_image(image: np.ndarray) -> np.ndarray:
     emb = model.get_image_features(**inputs)
     emb = emb / emb.norm(dim=-1, keepdim=True)
     return emb.cpu().numpy().astype("float32")[0]
+
+
+# ── Phase 4: Clip-level embedding ─────────────────────────
+
+def _encode_clip_light(frame_embeddings: np.ndarray, motion_scores: list[float]) -> np.ndarray:
+    """Combine averaged frame embeddings + motion stats into a single clip vector.
+
+    Uses already-computed frame embeddings (L2-normalized) and motion scores
+    from motion sampling. No optical flow needed.
+    """
+    avg_emb = np.mean(frame_embeddings, axis=0)
+    ms = np.array(motion_scores, dtype="float32")
+    mw = settings.CLIP_MOTION_WEIGHT
+    motion_feat = np.array([float(np.mean(ms)), float(np.std(ms)), float(np.max(ms))], dtype="float32")
+    clip_vec = np.concatenate([avg_emb * (1 - mw), motion_feat * mw])
+    norm = np.linalg.norm(clip_vec)
+    if norm > 0:
+        clip_vec = clip_vec / norm
+    return clip_vec
+
+
+# ── Phase 3: Optional scene captioner ──────────────────────
+
+_CAPTIONER_LOCK = threading.Lock()
+_CAPTIONER_INSTANCE = None
+
+class Captioner:
+    """Florence-2 caption generator. Lazy-loaded; graceful fallback."""
+
+    def __init__(self, model_name: str = None):
+        self.model_name = model_name or settings.CAPTIONER_MODEL
+        self._processor = None
+        self._model = None
+
+    def _load(self):
+        from transformers import AutoModelForCausalLM, AutoProcessor
+        logger.info("Loading captioner '%s' on %s...", self.model_name, device)
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_name, trust_remote_code=True)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_name, trust_remote_code=True
+        ).to(device).eval()
+        logger.info("Captioner loaded")
+
+    def caption(self, image: np.ndarray) -> str:
+        if self._model is None:
+            self._load()
+        with torch.inference_mode():
+            prompt = "<MORE_DETAILED_CAPTURE>"
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            inputs = self._processor(text=prompt, images=rgb,
+                                     return_tensors="pt").to(device)
+            outputs = self._model.generate(
+                **inputs, max_new_tokens=512, num_beams=3)
+            return self._processor.decode(outputs[0], skip_special_tokens=True)
+
+
+def _get_captioner() -> Captioner | None:
+    global _CAPTIONER_INSTANCE
+    if _CAPTIONER_INSTANCE is None:
+        with _CAPTIONER_LOCK:
+            if _CAPTIONER_INSTANCE is None:
+                try:
+                    _CAPTIONER_INSTANCE = Captioner()
+                except Exception:
+                    logger.exception("Failed to load captioner; captioning disabled")
+                    _CAPTIONER_INSTANCE = False
+    return _CAPTIONER_INSTANCE if _CAPTIONER_INSTANCE is not False else None
+
+
+class SimpleTracker:
+    """IoU-based multi-object tracker. No external dependencies."""
+    def __init__(self, match_thresh: float = 0.5, track_buffer: int = 30):
+        self.match_thresh = match_thresh
+        self.track_buffer = track_buffer
+        self._tracks: dict[int, dict] = {}
+        self._next_id = 0
+        self._frame_num = 0
+
+    @staticmethod
+    def _iou(a: list[int], b: list[int]) -> float:
+        x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+        x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def update(self, detections: list[dict], frame_idx: int) -> list[dict]:
+        self._frame_num += 1
+        if not detections:
+            for t in self._tracks.values():
+                t["active"] = False
+            return []
+
+        assigned_dets: set[int] = set()
+        results: list[dict] = []
+
+        for tid in sorted(self._tracks):
+            trk = self._tracks[tid]
+            if not trk["active"]:
+                continue
+            best_iou, best_di = self.match_thresh, -1
+            for di, det in enumerate(detections):
+                if di in assigned_dets or det["label"] != trk["label"]:
+                    continue
+                iou = self._iou(det["bbox"], trk["last_bbox"])
+                if iou > best_iou:
+                    best_iou, best_di = iou, di
+            if best_di >= 0:
+                assigned_dets.add(best_di)
+                d = detections[best_di]
+                trk["frames"].append(frame_idx)
+                trk["bboxes"].append(d["bbox"])
+                trk["scores"].append(d["score"])
+                trk["last_bbox"] = d["bbox"]
+                trk["last_seen"] = self._frame_num
+                results.append({**d, "track_id": tid})
+
+        for di, d in enumerate(detections):
+            if di in assigned_dets:
+                continue
+            tid = self._next_id
+            self._next_id += 1
+            self._tracks[tid] = {
+                "label": d["label"], "frames": [frame_idx],
+                "bboxes": [d["bbox"]], "scores": [d["score"]],
+                "last_bbox": d["bbox"], "last_seen": self._frame_num,
+                "active": True,
+            }
+            results.append({**d, "track_id": tid})
+
+        for t in self._tracks.values():
+            if self._frame_num - t["last_seen"] > self.track_buffer:
+                t["active"] = False
+        return results
+
+    def summary(self) -> dict:
+        out = {}
+        for tid, t in self._tracks.items():
+            if len(t["frames"]) < 2:
+                continue
+            b = t["bboxes"]
+            cx = [(b[i][0] + b[i][2]) / 2 for i in range(len(b))]
+            cy = [(b[i][1] + b[i][3]) / 2 for i in range(len(b))]
+            displacement = ((cx[-1] - cx[0])**2 + (cy[-1] - cy[0])**2) ** 0.5
+            out[str(tid)] = {
+                "class": t["label"], "start_frame": t["frames"][0],
+                "end_frame": t["frames"][-1], "total_frames": len(t["frames"]),
+                "avg_confidence": round(sum(t["scores"]) / len(t["scores"]), 4),
+                "displacement": round(displacement, 2),
+            }
+        return out
+
+
+class MetadataDB:
+    """Per-video SQLite metadata store for queryable object/track lookup."""
+
+    def __init__(self, db_path: Path):
+        self.conn = sqlite3.connect(str(db_path))
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS objects (
+                id INTEGER PRIMARY KEY,
+                frame_idx INTEGER, track_id INTEGER DEFAULT -1,
+                class TEXT, confidence REAL,
+                bbox_x1 INTEGER, bbox_y1 INTEGER,
+                bbox_x2 INTEGER, bbox_y2 INTEGER,
+                timestamp REAL,
+                motion_score REAL DEFAULT 0
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracks (
+                track_id INTEGER PRIMARY KEY,
+                class TEXT, start_frame INTEGER, end_frame INTEGER,
+                total_frames INTEGER, avg_confidence REAL, displacement REAL
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_obj_class ON objects(class)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_obj_track ON objects(track_id)")
+        self.conn.commit()
+
+    def populate(self, object_metadata: list[dict], track_metadata: dict,
+                 frame_indices: list[int], timestamps: list[float]):
+        frame_to_ts = dict(zip(frame_indices, timestamps))
+        for obj in object_metadata:
+            fi = obj["frame_idx"]
+            b = obj["bbox"]
+            self.conn.execute(
+                "INSERT INTO objects (frame_idx, track_id, class, confidence, "
+                "bbox_x1, bbox_y1, bbox_x2, bbox_y2, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (fi, obj.get("track_id", -1), obj["label"], obj["score"],
+                 b[0], b[1], b[2], b[3], frame_to_ts.get(fi, 0.0)))
+        for tid_str, td in track_metadata.items():
+            self.conn.execute(
+                "INSERT OR REPLACE INTO tracks "
+                "(track_id, class, start_frame, end_frame, total_frames, avg_confidence, displacement) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(tid_str), td["class"], td["start_frame"], td["end_frame"],
+                 td["total_frames"], td["avg_confidence"], td["displacement"]))
+        self.conn.commit()
+
+    def query_objects(self, class_name: str = None, track_id: int = None,
+                      min_confidence: float = 0.0) -> list[dict]:
+        clauses = ["confidence >= ?"]
+        params: list = [min_confidence]
+        if class_name:
+            clauses.append("class = ?")
+            params.append(class_name)
+        if track_id is not None:
+            clauses.append("track_id = ?")
+            params.append(track_id)
+        rows = self.conn.execute(
+            "SELECT * FROM objects WHERE " + " AND ".join(clauses), params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_track(self, track_id: int) -> dict | None:
+        r = self.conn.execute(
+            "SELECT * FROM tracks WHERE track_id = ?", (track_id,)).fetchone()
+        return dict(r) if r else None
+
+    def close(self):
+        self.conn.close()
 
 
 def _motion_score_farneback(prev_gray, gray):
@@ -366,6 +651,48 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     embs = compute_embeddings(frames, progress=progress)
     t3 = time.time()
 
+    # ── Phase 4: build overlapping clip embeddings ──
+    clip_indices: list[list[int]] = []
+    clip_embs_list: list[np.ndarray] = []
+    w = settings.CLIP_WINDOW_SIZE
+    stride = settings.CLIP_STRIDE
+    for i in range(0, max(1, len(keep_frames) - w + 1), stride):
+        win_frame_idxs = keep_frames[i:i + w]
+        win_embs = embs[i:i + w]
+        win_motion = motion_scores[i:i + w]
+        clip_indices.append(win_frame_idxs)
+        clip_embs_list.append(_encode_clip_light(win_embs, win_motion))
+    clip_embeddings_arr = np.array(clip_embs_list, dtype="float32") if clip_embs_list else np.empty((0, 515), dtype="float32")
+    t_clip = time.time()
+    if len(clip_embeddings_arr) > 0:
+        logger.info("Clip embeddings: %d clips from %d frames in %.1fs",
+                    len(clip_embeddings_arr), len(keep_frames), t_clip - t3)
+
+    captions: dict[int, str] = {}
+    caption_embs: np.ndarray | None = None
+    t_cap = t3
+    if settings.CAPTIONER_ENABLED:
+        if progress is not None:
+            progress["stage"] = "caption"
+            progress["message"] = f"Generating captions for {len(frames)} keyframes..."
+        logger.info("Captioning %d keyframes with %s...", len(frames), settings.CAPTIONER_MODEL)
+        captioner = _get_captioner()
+        if captioner is not None:
+            caption_texts: list[str] = []
+            for fi_idx, (frame_idx, frame) in enumerate(zip(keep_frames, frames)):
+                try:
+                    cap = captioner.caption(frame)
+                    captions[frame_idx] = cap
+                    caption_texts.append(cap)
+                except Exception:
+                    logger.exception("Caption failed for frame %d", frame_idx)
+                if progress is not None and (fi_idx + 1) % max(1, len(frames) // 5) == 0:
+                    progress["message"] = f"Captioned: {fi_idx+1}/{len(frames)} frames"
+            if caption_texts:
+                logger.info("Encoding %d captions...", len(caption_texts))
+                caption_embs = embed_text(caption_texts)
+    t_cap = time.time()
+
     object_metadata: list[dict] = []
     object_crops: list[np.ndarray] = []
     object_embs: np.ndarray = np.empty((0, settings.INDEX_OBJECT_EMBED_DIM), dtype="float32")
@@ -374,14 +701,17 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     if progress is not None:
         progress["stage"] = "detect_objects"
         progress["message"] = f"Detecting objects in {len(frames)} keyframes..."
-    logger.info("Phase 1: detecting objects in %d keyframes...", len(frames))
+    logger.info("Phase 1+2: detecting + tracking objects in %d keyframes...", len(frames))
     t_od = time.time()
+    tracker = SimpleTracker(match_thresh=settings.TRACK_MATCH_THRESHOLD,
+                             track_buffer=settings.TRACK_BUFFER)
     for fi_idx, (frame_idx, frame) in enumerate(zip(keep_frames, frames)):
         try:
             dets = detect(frame, settings.INDEX_DETECTION_PROMPTS, threshold=settings.INDEX_OBJECT_CONFIDENCE)
         except Exception:
             dets = []
-        for d in dets:
+        tracked = tracker.update(dets, frame_idx)
+        for d in tracked:
             x1, y1, x2, y2 = d["bbox"]
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
@@ -391,10 +721,12 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
                 "bbox": d["bbox"],
                 "label": d["label"],
                 "score": d["score"],
+                "track_id": d["track_id"],
             })
             object_crops.append(crop)
         if progress is not None and (fi_idx + 1) % max(1, len(frames) // 5) == 0:
-            progress["message"] = f"Detected objects: {fi_idx+1}/{len(frames)} frames, {len(object_metadata)} found"
+            progress["message"] = f"Detected+tracked: {fi_idx+1}/{len(frames)} frames, {len(object_metadata)} objects"
+    track_metadata = tracker.summary()
     t_od_end = time.time()
     if object_crops:
         logger.info("CLIP encoding %d object crops...", len(object_crops))
@@ -403,13 +735,23 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     logger.info("Object detection: %d objects in %.1fs, embedding: %.1fs",
                 len(object_metadata), t_od_end - t_od, t_oe - t_od_end)
 
+    mdb_path = STORAGE / "frames" / video_id / "metadata.db"
+    try:
+        mdb = MetadataDB(mdb_path)
+        mdb.populate(object_metadata, track_metadata, keep_frames, timestamps)
+        mdb.close()
+    except Exception:
+        logger.exception("Failed to create metadata DB for %s", video_id)
+
     idx = VideoIndex(video_id=video_id, frame_indices=keep_frames, timestamps=timestamps,
                      motion_scores=motion_scores, total_frames=total,
                      metadata={"fps": round(fps, 2), "width": width, "height": height, "duration": round(total / max(fps, 1), 2)},
                      benchmarks={"scan_time": round(t1 - t0, 2), "extract_time": round(t2 - t1, 2),
                                  "embed_time": round(t3 - t2, 2), "detection_time": round(t_oe - t3, 2),
+                                 "caption_time": round(t_cap - t3, 2),
                                  "total_time": round(t_oe - t0, 2)},
-                     object_metadata=object_metadata)
+                     object_metadata=object_metadata, track_metadata=track_metadata,
+                     captions=captions, clip_indices=clip_indices)
 
     t4 = time.time()
     faiss_index = build_faiss_index(embs)
@@ -429,6 +771,18 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         idx.save_object_faiss_index(object_faiss_index)
         idx.save_object_embeddings(object_embs)
         logger.info("Object FAISS index built: %d objects in %.1fs", len(object_embs), time.time() - t_oe)
+
+    if caption_embs is not None and len(caption_embs) > 0:
+        caption_faiss_index = build_faiss_index(caption_embs)
+        idx.save_caption_faiss_index(caption_faiss_index)
+        idx.save_caption_embeddings(caption_embs)
+        logger.info("Caption FAISS index built: %d captions in %.1fs",
+                    len(caption_embs), time.time() - t_cap)
+
+    if len(clip_embeddings_arr) > 0:
+        idx.save_clip_embeddings(clip_embeddings_arr)
+        logger.info("Clip embeddings saved: %d clips in %.1fs",
+                    len(clip_embeddings_arr), time.time() - t_clip)
 
     if progress is not None:
         progress["stage"] = "save"
@@ -455,6 +809,7 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     bm.record_index(t1 - t0, t2 - t1, t3 - t2, t_oe - t0, total, len(keep_frames))
     logger.info("Times: scan=%.1fs, extract=%.1fs, embed=%.1fs, faiss=%.1fs, detection=%.1fs, total=%.1fs",
                 t1 - t0, t2 - t1, t3 - t2, tf - t4, t_oe - t3, t_oe - t0)
-    logger.info("Indexed %s: %d keyframes, %d objects, from %d total frames",
-                video_id, len(keep_frames), len(object_metadata), total)
+    n_tracks = len(track_metadata)
+    logger.info("Indexed %s: %d keyframes, %d objects, %d tracks, from %d total frames",
+                video_id, len(keep_frames), len(object_metadata), n_tracks, total)
     return idx

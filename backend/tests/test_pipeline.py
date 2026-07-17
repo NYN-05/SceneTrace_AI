@@ -6,7 +6,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 from pipeline import (
-    frames_to_segments, parse_query, build_faiss_index, embed_text, _motion_score_diff
+    frames_to_segments, parse_query, build_faiss_index, embed_text, _motion_score_diff,
+    SimpleTracker, MetadataDB
 )
 
 def test_frames_to_segments_merges_consecutive():
@@ -61,6 +62,139 @@ def test_build_faiss_index_large():
     embs = np.random.rand(100, 512).astype("float32")
     idx = build_faiss_index(embs)
     assert idx.ntotal == 100
+
+
+def test_tracker_empty():
+    trk = SimpleTracker()
+    assert trk.update([], 0) == []
+
+
+def test_tracker_new_track():
+    trk = SimpleTracker()
+    dets = [{"bbox": [0, 0, 10, 10], "label": "car", "score": 0.9}]
+    r = trk.update(dets, 0)
+    assert len(r) == 1
+    assert r[0]["track_id"] == 0
+    assert r[0]["label"] == "car"
+
+
+def test_tracker_iou_match():
+    trk = SimpleTracker(match_thresh=0.3)
+    trk.update([{"bbox": [0, 0, 10, 10], "label": "car", "score": 0.9}], 0)
+    r = trk.update([{"bbox": [1, 1, 11, 11], "label": "car", "score": 0.85}], 1)
+    assert len(r) == 1
+    assert r[0]["track_id"] == 0
+
+
+def test_tracker_new_track_on_low_iou():
+    trk = SimpleTracker(match_thresh=0.8)
+    trk.update([{"bbox": [0, 0, 10, 10], "label": "car", "score": 0.9}], 0)
+    r = trk.update([{"bbox": [50, 50, 60, 60], "label": "car", "score": 0.85}], 1)
+    assert len(r) == 1
+    assert r[0]["track_id"] == 1
+
+
+def test_tracker_multiple_classes():
+    trk = SimpleTracker(match_thresh=0.3)
+    trk.update([{"bbox": [0, 0, 10, 10], "label": "car", "score": 0.9}], 0)
+    r = trk.update([{"bbox": [1, 1, 11, 11], "label": "person", "score": 0.85}], 1)
+    assert len(r) == 1
+    assert r[0]["track_id"] == 1
+
+
+def test_tracker_summary():
+    trk = SimpleTracker(match_thresh=0.3)
+    trk.update([{"bbox": [0, 0, 10, 10], "label": "car", "score": 0.9}], 0)
+    trk.update([{"bbox": [2, 2, 12, 12], "label": "car", "score": 0.85}], 1)
+    trk.update([{"bbox": [4, 4, 14, 14], "label": "car", "score": 0.8}], 2)
+    s = trk.summary()
+    assert "0" in s
+    assert s["0"]["total_frames"] == 3
+    assert s["0"]["class"] == "car"
+
+
+def test_tracker_summary_skips_short():
+    trk = SimpleTracker()
+    trk.update([{"bbox": [0, 0, 10, 10], "label": "car", "score": 0.9}], 0)
+    s = trk.summary()
+    assert len(s) == 0
+
+
+def test_metadata_db_create_and_populate(tmpdir):
+    db_path = Path(tmpdir) / "test.db"
+    mdb = MetadataDB(db_path)
+    objs = [
+        {"frame_idx": 0, "bbox": [0, 0, 10, 10], "label": "car", "score": 0.9, "track_id": 0},
+        {"frame_idx": 1, "bbox": [5, 5, 15, 15], "label": "person", "score": 0.85, "track_id": 1},
+    ]
+    tracks = {"0": {"class": "car", "start_frame": 0, "end_frame": 5, "total_frames": 3,
+                     "avg_confidence": 0.9, "displacement": 10.0}}
+    mdb.populate(objs, tracks, [0, 1], [0.0, 0.033])
+    mdb.close()
+    assert db_path.exists()
+    assert db_path.stat().st_size > 0
+
+
+def test_metadata_db_query_objects_all(tmpdir):
+    db_path = Path(tmpdir) / "test.db"
+    mdb = MetadataDB(db_path)
+    objs = [
+        {"frame_idx": 0, "bbox": [0, 0, 10, 10], "label": "car", "score": 0.9, "track_id": 0},
+        {"frame_idx": 1, "bbox": [5, 5, 15, 15], "label": "person", "score": 0.85, "track_id": 1},
+    ]
+    mdb.populate(objs, {}, [0, 1], [0.0, 0.033])
+    results = mdb.query_objects()
+    mdb.close()
+    assert len(results) == 2
+
+
+def test_metadata_db_query_by_class(tmpdir):
+    db_path = Path(tmpdir) / "test.db"
+    mdb = MetadataDB(db_path)
+    objs = [
+        {"frame_idx": 0, "bbox": [0, 0, 10, 10], "label": "car", "score": 0.9, "track_id": 0},
+        {"frame_idx": 1, "bbox": [5, 5, 15, 15], "label": "person", "score": 0.85, "track_id": 1},
+    ]
+    mdb.populate(objs, {}, [0, 1], [0.0, 0.033])
+    results = mdb.query_objects(class_name="car")
+    mdb.close()
+    assert len(results) == 1
+    assert results[0]["class"] == "car"
+
+
+def test_metadata_db_query_by_confidence(tmpdir):
+    db_path = Path(tmpdir) / "test.db"
+    mdb = MetadataDB(db_path)
+    objs = [
+        {"frame_idx": 0, "bbox": [0, 0, 10, 10], "label": "car", "score": 0.9, "track_id": 0},
+        {"frame_idx": 1, "bbox": [5, 5, 15, 15], "label": "car", "score": 0.5, "track_id": 1},
+    ]
+    mdb.populate(objs, {}, [0, 1], [0.0, 0.033])
+    results = mdb.query_objects(class_name="car", min_confidence=0.7)
+    mdb.close()
+    assert len(results) == 1
+    assert results[0]["confidence"] == 0.9
+
+
+def test_metadata_db_get_track(tmpdir):
+    db_path = Path(tmpdir) / "test.db"
+    mdb = MetadataDB(db_path)
+    tracks = {"0": {"class": "car", "start_frame": 0, "end_frame": 5, "total_frames": 3,
+                     "avg_confidence": 0.9, "displacement": 10.0}}
+    mdb.populate([], tracks, [], [])
+    trk = mdb.get_track(0)
+    mdb.close()
+    assert trk is not None
+    assert trk["class"] == "car"
+    assert trk["total_frames"] == 3
+
+
+def test_metadata_db_get_track_missing(tmpdir):
+    db_path = Path(tmpdir) / "test.db"
+    mdb = MetadataDB(db_path)
+    trk = mdb.get_track(999)
+    mdb.close()
+    assert trk is None
 
 def test_embed_text_output_shape():
     emb = embed_text(["test query"])

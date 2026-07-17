@@ -20,8 +20,18 @@ class Settings:
     YOLO_WORLD_DEFAULT: str = os.getenv("YOLO_WORLD_DEFAULT", "large")
     YOLO_WORLD_FALLBACKS: str = os.getenv("YOLO_WORLD_FALLBACKS", "large,medium,small")
 
+    # ---- 6-signal hybrid scoring weights (roadmap §6.1) ----
+    CLIP_WEIGHT: float = float(os.getenv("CLIP_WEIGHT", "0.20"))
+    CAPTION_WEIGHT: float = float(os.getenv("CAPTION_WEIGHT", "0.20"))
+    OBJECT_MATCH_WEIGHT: float = float(os.getenv("OBJECT_MATCH_WEIGHT", "0.25"))
+    MOTION_MATCH_WEIGHT: float = float(os.getenv("MOTION_MATCH_WEIGHT", "0.10"))
+    TRACK_CONSISTENCY_WEIGHT: float = float(os.getenv("TRACK_CONSISTENCY_WEIGHT", "0.15"))
+    TEMPORAL_WEIGHT: float = float(os.getenv("TEMPORAL_WEIGHT", "0.10"))
+    RELATIONSHIP_WEIGHT: float = float(os.getenv("RELATIONSHIP_WEIGHT", "0.10"))
+    # backward-compat aliases (used for reporting / old test mock compat)
     SEMANTIC_WEIGHT: float = float(os.getenv("SEMANTIC_WEIGHT", "0.55"))
     OBJECT_WEIGHT: float = float(os.getenv("OBJECT_WEIGHT", "0.45"))
+
     DETECTION_THRESHOLD: float = float(os.getenv("DETECTION_THRESHOLD", "0.2"))
     SEARCH_HIGH_THRESHOLD: float = float(os.getenv("SEARCH_HIGH_THRESHOLD", "0.25"))
     SEARCH_MEDIUM_THRESHOLD: float = float(os.getenv("SEARCH_MEDIUM_THRESHOLD", "0.15"))
@@ -47,6 +57,23 @@ class Settings:
     INDEX_MIN_FPS: int = int(os.getenv("INDEX_MIN_FPS", "5"))
     INDEX_OBJECT_CONFIDENCE: float = float(os.getenv("INDEX_OBJECT_CONFIDENCE", "0.3"))
     INDEX_OBJECT_EMBED_DIM: int = int(os.getenv("INDEX_OBJECT_EMBED_DIM", "512"))
+
+    TRACK_MATCH_THRESHOLD: float = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.5"))
+    TRACK_BUFFER: int = int(os.getenv("TRACK_BUFFER", "30"))
+    TRACK_CONSISTENCY_WEIGHT: float = float(os.getenv("TRACK_CONSISTENCY_WEIGHT", "0.10"))
+
+    # ---- Phase 3: Scene captioning & query parsing ----
+    CAPTIONER_MODEL: str = os.getenv("CAPTIONER_MODEL", "microsoft/Florence-2-base")
+    CAPTIONER_ENABLED: bool = os.getenv("CAPTIONER_ENABLED", "").lower() in ("1", "true", "yes")
+    QUERY_PARSER_MODE: str = os.getenv("QUERY_PARSER_MODE", "regex")
+
+    # ---- Phase 4: Clip-level indexing & temporal reasoning ----
+    CLIP_WINDOW_SIZE: int = int(os.getenv("CLIP_WINDOW_SIZE", "3"))
+    CLIP_STRIDE: int = int(os.getenv("CLIP_STRIDE", "2"))
+    CLIP_MOTION_WEIGHT: float = float(os.getenv("CLIP_MOTION_WEIGHT", "0.3"))
+
+    RERANKER_MODEL: str = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+    RERANKER_ENABLED: bool = os.getenv("RERANKER_ENABLED", "").lower() in ("1", "true", "yes")
 
     API_KEY: str = os.getenv("API_KEY", "")
     API_KEY_NAME: str = "X-API-Key"

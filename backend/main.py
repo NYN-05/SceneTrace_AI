@@ -63,6 +63,7 @@ def _load_persisted_indexes():
                     metadata=data.get("metadata", {}),
                     benchmarks=data.get("benchmarks", {}),
                     object_metadata=data.get("object_metadata", []),
+                    track_metadata=data.get("track_metadata", {}),
                 )
                 with _indexes_lock:
                     _indexes[vi.video_id] = vi

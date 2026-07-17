@@ -10,3 +10,6 @@ faiss-cpu>=1.8,<2
 Pillow>=10,<11
 slowapi>=0.1.9,<1
 python-dotenv>=1,<2
+cachetools>=5.3,<6
+python-magic>=0.4.27,<1
+fastapi-limiter>=0.1.6,<1

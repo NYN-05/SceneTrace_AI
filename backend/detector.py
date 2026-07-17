@@ -2,8 +2,12 @@
 import cv2
 import numpy as np
 import torch
+import logging
+from config import settings
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+logger = logging.getLogger("scenetrace.detector")
+
+device = settings.DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
 _detector = None
 _processor = None
 
@@ -12,23 +16,23 @@ def load():
     if _detector is not None:
         return
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
-    print(f"Loading Grounding DINO on {device}...")
+    logger.info("Loading Grounding DINO on %s...", device)
     _detector = AutoModelForZeroShotObjectDetection.from_pretrained(
-        "IDEA-Research/grounding-dino-base"
+        settings.DETECTOR_MODEL_NAME
     ).to(device).eval()
-    _processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
-    print("Grounding DINO loaded")
+    _processor = AutoProcessor.from_pretrained(settings.DETECTOR_MODEL_NAME)
+    logger.info("Grounding DINO loaded")
 
 @torch.inference_mode()
-def detect(image: np.ndarray, text: str, threshold: float = 0.2) -> list[dict]:
-    """Detect objects matching text in an image. Returns [{bbox, label, score}, ...]."""
+def detect(image: np.ndarray, text: str, threshold: float = 0) -> list[dict]:
     load()
+    thresh = threshold or settings.DETECTION_THRESHOLD
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     inputs = _processor(images=rgb, text=text, return_tensors="pt").to(device)
     outputs = _detector(**inputs)
     h, w = image.shape[:2]
     target = torch.tensor([[w, h]], device=device)
-    results = _processor.post_process_object_detection(outputs, threshold=threshold, target_sizes=target)[0]
+    results = _processor.post_process_object_detection(outputs, threshold=thresh, target_sizes=target)[0]
     dets = []
     for box, score, label in zip(results["boxes"], results["scores"], results["labels"]):
         b = box.cpu().tolist()
@@ -40,7 +44,6 @@ def detect(image: np.ndarray, text: str, threshold: float = 0.2) -> list[dict]:
     return dets
 
 def render(image: np.ndarray, detections: list[dict]) -> np.ndarray:
-    """Draw bounding boxes on a copy of the image."""
     img = image.copy()
     for d in detections:
         x1, y1, x2, y2 = d["bbox"]
@@ -52,7 +55,6 @@ def render(image: np.ndarray, detections: list[dict]) -> np.ndarray:
     return img
 
 def detect_and_save(image_path: str, text: str, output_path: str = None) -> list[dict]:
-    """Convenience: load image, detect, optionally save annotated version."""
     img = cv2.imread(str(image_path))
     if img is None:
         return []

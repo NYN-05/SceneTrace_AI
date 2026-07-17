@@ -2,14 +2,18 @@
 import time
 import cv2
 import numpy as np
+import logging
 from pathlib import Path
+from cachetools import TTLCache
 from pipeline import STORAGE, search_embeddings, frames_to_segments
 from benchmark import benchmark
+from config import settings
 
-_DET_CACHE: dict[str, list] = {}
+logger = logging.getLogger("scenetrace.search")
 
-def _get_detections_for_segment(seg, query):
-    """Run Grounding DINO on the middle frame of a segment. Cache results."""
+_DET_CACHE: TTLCache = TTLCache(maxsize=settings.DET_CACHE_MAXSIZE, ttl=settings.DET_CACHE_TTL)
+
+def _get_detections_for_segment(seg: dict, query: str) -> list:
     vid, indices = seg["video_id"], seg["frame_indices"]
     mid = indices[len(indices) // 2]
     key = f"{vid}_{mid}"
@@ -25,8 +29,9 @@ def _get_detections_for_segment(seg, query):
         _DET_CACHE[key] = []
         return []
     try:
-        dets = detect(img, query, threshold=0.2)
+        dets = detect(img, query, threshold=settings.DETECTION_THRESHOLD)
     except Exception:
+        logger.exception("Detection failed for %s", key)
         dets = []
     if dets:
         from detector import render
@@ -43,8 +48,8 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
 
     candidates = []
     for vid, idx in indexes.items():
-        embs = np.array(idx.embeddings, dtype="float32")
-        if len(embs) == 0:
+        embs = idx.load_embeddings()
+        if embs is None or len(embs) == 0:
             continue
         faiss_idx = idx.get_faiss_index()
         indices, scores = search_embeddings(query, faiss_idx, embs, top_k * 3)
@@ -61,7 +66,6 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
     candidates.sort(key=lambda s: s["semantic_score"], reverse=True)
     segments = candidates[:top_k]
 
-    # Object detection on top-K
     if enable_detection:
         for seg in segments:
             try:
@@ -70,7 +74,7 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
                 obj_scores = [d["score"] * 0.5 for d in dets]
                 seg["object_score"] = round(sum(obj_scores) / max(len(obj_scores), 1), 4) if obj_scores else 0
             except Exception as e:
-                print(f"Detection error on {seg.get('video_id')}: {e}")
+                logger.exception("Detection error on %s", seg.get("video_id"))
                 seg["detections"] = []
                 seg["object_score"] = 0
     else:
@@ -78,11 +82,10 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
             seg["detections"] = []
             seg["object_score"] = 0
 
-    # Weighted scoring
     for seg in segments:
         s = seg["semantic_score"]
         o = seg["object_score"]
-        w = round(0.55 * s + 0.45 * o, 4)
+        w = round(settings.SEMANTIC_WEIGHT * s + settings.OBJECT_WEIGHT * o, 4)
         seg["weighted_score"] = w
         seg["score_breakdown"] = {
             "semantic_similarity": round(s, 3),
@@ -96,7 +99,7 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
 
     segments.sort(key=lambda s: s["weighted_score"], reverse=True)
     top_score = segments[0]["weighted_score"] if segments else 0
-    status = "high" if top_score > 0.25 else ("medium" if top_score > 0.15 else "low")
+    status = "high" if top_score > settings.SEARCH_HIGH_THRESHOLD else ("medium" if top_score > settings.SEARCH_MEDIUM_THRESHOLD else "low")
 
     elapsed = time.time() - t0
     benchmark.record_query(elapsed)
@@ -109,7 +112,6 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
     }
 
 def suggest(text: str) -> list[str]:
-    """Simple query suggestions based on common patterns."""
     suggestions = {
         "person": ["person walking", "person running", "person carrying something", "person entering", "person leaving"],
         "car": ["car driving", "car parked", "car entering", "car leaving"],

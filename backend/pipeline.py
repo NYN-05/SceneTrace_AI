@@ -5,16 +5,22 @@ from pathlib import Path
 import faiss
 import json
 import re
+import logging
+import threading
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from benchmark import benchmark as bm
+from config import settings, logger
 
 STORAGE = Path(__file__).parent / "storage"
 for _d in ["originals", "frames", "clips", "reports"]:
     (STORAGE / _d).mkdir(parents=True, exist_ok=True)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = settings.DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
+
+_faiss_index_cache: dict[str, faiss.Index] = {}
+_faiss_cache_lock = threading.Lock()
 _HAS_FAISS_INDEX = set()
 
 @dataclass
@@ -22,7 +28,6 @@ class VideoIndex:
     video_id: str
     frame_indices: list[int] = field(default_factory=list)
     timestamps: list[float] = field(default_factory=list)
-    embeddings: list[list[float]] = field(default_factory=list)
     motion_scores: list[float] = field(default_factory=list)
     total_frames: int = 0
     metadata: dict = field(default_factory=lambda: {"fps": 0, "width": 0, "height": 0, "duration": 0})
@@ -31,45 +36,76 @@ class VideoIndex:
     def faiss_path(self) -> Path:
         return STORAGE / "frames" / self.video_id / "index.faiss"
 
+    def embeddings_path(self) -> Path:
+        return STORAGE / "frames" / self.video_id / "embeddings.npy"
+
     def get_faiss_index(self) -> faiss.Index | None:
+        with _faiss_cache_lock:
+            if self.video_id in _faiss_index_cache:
+                return _faiss_index_cache[self.video_id]
         p = self.faiss_path()
         if p.exists():
-            return faiss.read_index(str(p))
+            idx = faiss.read_index(str(p))
+            with _faiss_cache_lock:
+                _faiss_index_cache[self.video_id] = idx
+            return idx
         return None
 
     def save_faiss_index(self, index: faiss.Index):
         p = self.faiss_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         faiss.write_index(index, str(p))
+        with _faiss_cache_lock:
+            _faiss_index_cache[self.video_id] = index
         _HAS_FAISS_INDEX.add(self.video_id)
+
+    def invalidate_faiss_cache(self):
+        with _faiss_cache_lock:
+            _faiss_index_cache.pop(self.video_id, None)
+
+    def load_embeddings(self) -> np.ndarray | None:
+        p = self.embeddings_path()
+        if p.exists():
+            return np.load(str(p)).astype("float32")
+        return None
+
+    def save_embeddings(self, embeddings: np.ndarray):
+        p = self.embeddings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(p), embeddings)
 
 from transformers import CLIPModel, CLIPProcessor
 _clip_model = None
 _clip_processor = None
+_clip_lock = threading.Lock()
 
 def _get_clip():
     global _clip_model, _clip_processor
     if _clip_model is None:
-        print(f"Loading CLIP model on {device}...")
-        _clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
-        _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        print("CLIP model loaded")
+        with _clip_lock:
+            if _clip_model is None:
+                logger.info("Loading CLIP model on %s...", device)
+                _clip_model = CLIPModel.from_pretrained(settings.CLIP_MODEL_NAME).to(device).eval()
+                _clip_processor = CLIPProcessor.from_pretrained(settings.CLIP_MODEL_NAME)
+                logger.info("CLIP model loaded")
     return _clip_model, _clip_processor
 
 @torch.inference_mode()
-def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 32,
+def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 0,
                        progress: dict = None) -> np.ndarray:
     model, processor = _get_clip()
     all_embs = []
-    n_batches = max(1, (len(imgs) + batch_size - 1) // batch_size)
-    for i in range(0, len(imgs), batch_size):
-        batch = imgs[i:i+batch_size]
+    bs = batch_size or settings.BATCH_SIZE
+    n_batches = max(1, (len(imgs) + bs - 1) // bs)
+    for i in range(0, len(imgs), bs):
+        batch = imgs[i:i+bs]
         rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch]
         inputs = processor(images=rgb, return_tensors="pt", padding=True).to(device)
         emb = model.get_image_features(**inputs)
-        all_embs.append(emb.cpu().numpy())
+        emb_norm = emb / emb.norm(dim=-1, keepdim=True)
+        all_embs.append(emb_norm.cpu().numpy())
         if progress is not None:
-            batch_idx = i // batch_size + 1
+            batch_idx = i // bs + 1
             pct = min(99, 25 + int(60 * batch_idx / n_batches))
             progress["percent"] = pct
             progress["message"] = f"Embedding: batch {batch_idx}/{n_batches}"
@@ -82,7 +118,9 @@ def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 32,
 def embed_text(texts: list[str]) -> np.ndarray:
     model, processor = _get_clip()
     inputs = processor(text=texts, return_tensors="pt", padding=True).to(device)
-    return model.get_text_features(**inputs).cpu().numpy().astype("float32")
+    emb = model.get_text_features(**inputs)
+    emb = emb / emb.norm(dim=-1, keepdim=True)
+    return emb.cpu().numpy().astype("float32")
 
 def _motion_score_farneback(prev_gray, gray):
     flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
@@ -91,12 +129,14 @@ def _motion_score_farneback(prev_gray, gray):
 def _motion_score_diff(prev_gray, gray):
     return float(np.abs(gray.astype("i2") - prev_gray.astype("i2")).mean())
 
-def motion_sample(video_path: str, stride: int = 3, target_pct: float = 5.0,
+def motion_sample(video_path: str, stride: int = 0, target_pct: float = 0,
                   progress: dict = None, method: str = "diff") -> tuple[list[int], list[float], list[float], int]:
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     score_fn = _motion_score_farneback if method == "farneback" else _motion_score_diff
+    stride = stride or settings.MOTION_STRIDE
+    target_pct = target_pct or settings.MOTION_TARGET_PCT
     start = time.time()
     candidate_frames, timestamps, motion_mags = [], [], []
     prev_gray = None
@@ -140,7 +180,8 @@ def motion_sample(video_path: str, stride: int = 3, target_pct: float = 5.0,
         keep_frames.insert(0, 0)
         ts.insert(0, 0.0)
         sc.insert(0, sc[0] if sc else 0.0)
-    print(f"  Motion scan: {count} frames in {elapsed:.1f}s ({method}), thresh={thresh:.2f}, kept={len(keep_frames)} ({100*len(keep_frames)//max(count,1)}%)")
+    logger.info("Motion scan: %d frames in %.1fs (%s), thresh=%.2f, kept=%d (%d%%)",
+                count, elapsed, method, thresh, len(keep_frames), 100*len(keep_frames)//max(count,1))
     return keep_frames, ts, sc, total_frames
 
 def _extract_chunk(video_path: str, indices: list[int]) -> list[tuple[int, np.ndarray]]:
@@ -154,11 +195,12 @@ def _extract_chunk(video_path: str, indices: list[int]) -> list[tuple[int, np.nd
     cap.release()
     return result
 
-def extract_frames_parallel(video_path: str, frame_indices: list[int], num_workers: int = 4) -> list[np.ndarray]:
+def extract_frames_parallel(video_path: str, frame_indices: list[int], num_workers: int = 0) -> list[np.ndarray]:
     if not frame_indices:
         return []
-    chunks = np.array_split(frame_indices, min(num_workers, len(frame_indices)))
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+    nw = num_workers or settings.NUM_WORKERS
+    chunks = np.array_split(frame_indices, min(nw, len(frame_indices)))
+    with ThreadPoolExecutor(max_workers=nw) as pool:
         futures = [pool.submit(_extract_chunk, video_path, list(chunk)) for chunk in chunks if len(chunk) > 0]
         all_frames = []
         for f in as_completed(futures):
@@ -168,9 +210,7 @@ def extract_frames_parallel(video_path: str, frame_indices: list[int], num_worke
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
     n, d = embeddings.shape
-    embeddings = embeddings.copy()
-    faiss.normalize_L2(embeddings)
-    if n < 50:
+    if n < settings.FAISS_IVF_THRESHOLD:
         idx = faiss.IndexFlatIP(d)
         idx.add(embeddings)
         return idx
@@ -189,18 +229,17 @@ def search_embeddings(query: str, index: faiss.Index | None, embeddings: np.ndar
         return [], []
     if index is None:
         index = build_faiss_index(embeddings)
-    q_norm = q_emb.copy()
-    faiss.normalize_L2(q_norm)
-    scores, indices = index.search(q_norm, min(top_k, n))
+    scores, indices = index.search(q_emb, min(top_k, n))
     return indices[0].tolist(), scores[0].tolist()
 
-def frames_to_segments(indices: list[int], scores: list[float], gap_thresh: int = 3) -> list[dict]:
+def frames_to_segments(indices: list[int], scores: list[float], gap_thresh: int = 0) -> list[dict]:
     if not indices:
         return []
+    gt = gap_thresh or settings.GAP_THRESHOLD
     segs = []
     cur, cur_sc = [indices[0]], [scores[0]]
     for i in range(1, len(indices)):
-        if indices[i] - indices[i-1] <= gap_thresh:
+        if indices[i] - indices[i-1] <= gt:
             cur.append(indices[i]); cur_sc.append(scores[i])
         else:
             segs.append({"frame_indices": cur, "scores": cur_sc})
@@ -232,7 +271,6 @@ def extract_clip(video_path: str, start_time: float, end_time: float, output: st
 
 def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoIndex:
     t0 = time.time()
-    # Capture metadata
     cap_info = cv2.VideoCapture(video_path)
     fps = cap_info.get(cv2.CAP_PROP_FPS)
     width = int(cap_info.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -250,18 +288,18 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["stage"] = "extract"
         progress["percent"] = 20
         progress["message"] = f"Extracting {len(keep_frames)} keyframes..."
-    print(f"  Frame extraction ({len(keep_frames)} frames)...")
+    logger.info("Frame extraction (%d frames)...", len(keep_frames))
     frames = extract_frames_parallel(str(video_path), keep_frames)
     t2 = time.time()
     if progress is not None:
         progress["stage"] = "embed"
         progress["percent"] = 25
         progress["message"] = f"Embedding {len(frames)} frames..."
-    print(f"  CLIP embeddings ({len(frames)} frames)...")
+    logger.info("CLIP embeddings (%d frames)...", len(frames))
     embs = compute_embeddings(frames, progress=progress)
     t3 = time.time()
     idx = VideoIndex(video_id=video_id, frame_indices=keep_frames, timestamps=timestamps,
-                     embeddings=embs.tolist(), motion_scores=motion_scores, total_frames=total,
+                     motion_scores=motion_scores, total_frames=total,
                      metadata={"fps": round(fps, 2), "width": width, "height": height, "duration": round(total / max(fps, 1), 2)},
                      benchmarks={"scan_time": round(t1 - t0, 2), "extract_time": round(t2 - t1, 2),
                                  "embed_time": round(t3 - t2, 2), "total_time": round(t3 - t0, 2)})
@@ -269,14 +307,15 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     t4 = time.time()
     faiss_index = build_faiss_index(embs)
     tf = time.time()
-    print(f"  FAISS index build: {tf-t4:.1f}s")
+    logger.info("FAISS index build: %.1fs", tf - t4)
     if progress is not None:
         progress["percent"] = 88
-        progress["message"] = f"Built FAISS index..."
+        progress["message"] = "Built FAISS index..."
 
     out_dir = STORAGE / "frames" / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
     idx.save_faiss_index(faiss_index)
+    idx.save_embeddings(embs)
 
     if progress is not None:
         progress["stage"] = "save"
@@ -284,11 +323,16 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["message"] = f"Saving {len(keep_frames)} thumbnails..."
     def _save(idx_frame):
         i, f_idx = idx_frame
-        cv2.imwrite(str(out_dir / f"frame_{f_idx}.jpg"), frames[i], [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    with ThreadPoolExecutor(max_workers=4) as pool:
+        cv2.imwrite(str(out_dir / f"frame_{f_idx}.jpg"), frames[i], [int(cv2.IMWRITE_JPEG_QUALITY), settings.THUMBNAIL_QUALITY])
+    with ThreadPoolExecutor(max_workers=settings.NUM_WORKERS) as pool:
         pool.map(_save, enumerate(keep_frames))
+
+    idx_dict = asdict(idx)
+    idx_dict.pop("embeddings", None)
+    idx_dict["embeddings_path"] = str(idx.embeddings_path())
     with open(out_dir / "index.json", "w") as f:
-        json.dump(asdict(idx), f)
+        json.dump(idx_dict, f)
+
     if progress is not None:
         progress["stage"] = "done"
         progress["percent"] = 100
@@ -296,6 +340,7 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         progress["keyframes"] = len(keep_frames)
         progress["total_frames"] = total
     bm.record_index(t1 - t0, t2 - t1, t3 - t2, t3 - t0, total, len(keep_frames))
-    print(f"  Times: scan={t1-t0:.1f}s, extract={t2-t1:.1f}s, embed={t3-t2:.1f}s, faiss={tf-t4:.1f}s, total={t3-t0:.1f}s")
-    print(f"Indexed {video_id}: {len(keep_frames)} keyframes from {total} total frames")
+    logger.info("Times: scan=%.1fs, extract=%.1fs, embed=%.1fs, faiss=%.1fs, total=%.1fs",
+                t1 - t0, t2 - t1, t3 - t2, tf - t4, t3 - t0)
+    logger.info("Indexed %s: %d keyframes from %d total frames", video_id, len(keep_frames), total)
     return idx

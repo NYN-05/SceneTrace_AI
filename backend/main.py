@@ -5,14 +5,13 @@ import time
 import cv2
 import logging
 import threading
-import shutil
 from pathlib import Path
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -190,6 +189,32 @@ def get_index_progress(video_id: str):
     resp = dict(p)
     resp.pop("_t0", None)
     return resp
+
+@app.get("/api/videos/{video_id}/index-progress/stream")
+async def index_progress_stream(video_id: str):
+    async def event_generator():
+        last = None
+        while True:
+            with _index_progress_lock:
+                p = _index_progress.get(video_id)
+            if p is None:
+                with _indexes_lock:
+                    exists = video_id in _indexes
+                if exists:
+                    yield f"data: {json.dumps({'stage': 'done', 'percent': 100, 'message': 'Complete'})}\n\n"
+                    return
+                await asyncio.sleep(1)
+                continue
+            resp = dict(p)
+            resp.pop("_t0", None)
+            if resp != last:
+                yield f"data: {json.dumps(resp)}\n\n"
+                last = resp
+            if p.get("stage") in ("done", "error"):
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/api/videos/{video_id}/status")
 def video_status(video_id: str):

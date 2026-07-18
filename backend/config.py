@@ -60,7 +60,6 @@ class Settings:
 
     TRACK_MATCH_THRESHOLD: float = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.5"))
     TRACK_BUFFER: int = int(os.getenv("TRACK_BUFFER", "30"))
-    TRACK_CONSISTENCY_WEIGHT: float = float(os.getenv("TRACK_CONSISTENCY_WEIGHT", "0.10"))
 
     # ---- Phase 3: Scene captioning & query parsing ----
     CAPTIONER_MODEL: str = os.getenv("CAPTIONER_MODEL", "microsoft/Florence-2-base")

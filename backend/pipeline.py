@@ -274,7 +274,13 @@ class Captioner:
 
     def caption(self, image: np.ndarray) -> str:
         if self._model is None:
-            self._load()
+            try:
+                self._load()
+            except Exception:
+                logger.exception("Captioner failed to load; disabling")
+                self._model = False  # cache failure so we don't retry every frame
+        if self._model is False:
+            return ""
         with torch.inference_mode():
             prompt = "<MORE_DETAILED_CAPTURE>"
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -735,7 +741,9 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     logger.info("Object detection: %d objects in %.1fs, embedding: %.1fs",
                 len(object_metadata), t_od_end - t_od, t_oe - t_od_end)
 
-    mdb_path = STORAGE / "frames" / video_id / "metadata.db"
+    mdb_dir = STORAGE / "frames" / video_id
+    mdb_dir.mkdir(parents=True, exist_ok=True)
+    mdb_path = mdb_dir / "metadata.db"
     try:
         mdb = MetadataDB(mdb_path)
         mdb.populate(object_metadata, track_metadata, keep_frames, timestamps)

@@ -67,8 +67,11 @@ try {
         $p = Invoke-RestMethod -Uri "$api/videos/$vid/index-progress" -TimeoutSec 10
         if ($p.stage -eq "done") { $done = $true }
         elseif ($p.stage -eq "error") { throw "Index error: $($p.message)" }
-        else { Write-Host "    $($p.message) - $($p.percent)%" -ForegroundColor Gray }
+        else {
+            Write-Progress -Activity "Indexing $VideoPath" -Status $p.message -PercentComplete $p.percent -CurrentOperation "$($p.percent)%"
+        }
     } while (-not $done)
+    Write-Progress -Activity "Indexing $VideoPath" -Completed
     $sw.Stop()
     Write-Host "  $($p.keyframes) keyframes in $($sw.Elapsed.TotalSeconds.ToString('0.0'))s" -ForegroundColor Gray
     Check "Index -> keyframes" ($p.keyframes) "\d+"

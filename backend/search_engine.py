@@ -334,6 +334,9 @@ def _search_clip_embeddings(query: str, idx) -> dict[int, float]:
     if clip_embs is None or len(clip_embs) == 0 or not idx.clip_indices:
         return {}
     q_emb = embed_text([query])
+    # clip_embs are 515-dim (512 CLIP + 3 motion); trim to 512 for text comparison
+    if clip_embs.shape[1] == 515 and q_emb.shape[0] == 512:
+        clip_embs = clip_embs[:, :512]
     sims = np.dot(clip_embs, q_emb.T).flatten()
     frame_to_score: dict[int, float] = {}
     for clip_frames, sim in zip(idx.clip_indices, sims):

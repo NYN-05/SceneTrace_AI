@@ -38,7 +38,7 @@ class Settings:
     GAP_THRESHOLD: int = int(os.getenv("GAP_THRESHOLD", "3"))
     MOTION_STRIDE: int = int(os.getenv("MOTION_STRIDE", "3"))
     MOTION_TARGET_PCT: float = float(os.getenv("MOTION_TARGET_PCT", "5.0"))
-    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "32"))
+    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "64"))
     NUM_WORKERS: int = int(os.getenv("NUM_WORKERS", "4"))
     THUMBNAIL_QUALITY: int = int(os.getenv("THUMBNAIL_QUALITY", "80"))
     DET_CACHE_MAXSIZE: int = int(os.getenv("DET_CACHE_MAXSIZE", "5000"))

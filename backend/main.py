@@ -48,26 +48,39 @@ def _load_persisted_indexes():
     frames_dir = STORAGE / "frames"
     if not frames_dir.exists():
         return
-    for idx_dir in frames_dir.iterdir():
+
+    def _load_one(idx_dir: Path) -> VideoIndex | None:
         idx_file = idx_dir / "index.json"
-        if idx_file.exists():
-            try:
-                data = json.loads(idx_file.read_text())
-                vi = VideoIndex(
-                    video_id=data.get("video_id", idx_dir.name),
-                    frame_indices=data.get("frame_indices", []),
-                    timestamps=data.get("timestamps", []),
-                    motion_scores=data.get("motion_scores", []),
-                    total_frames=data.get("total_frames", 0),
-                    metadata=data.get("metadata", {}),
-                    benchmarks=data.get("benchmarks", {}),
-                    object_metadata=data.get("object_metadata", []),
-                    track_metadata=data.get("track_metadata", {}),
-                )
-                with _indexes_lock:
-                    _indexes[vi.video_id] = vi
-            except Exception:
-                logger.exception("Failed loading persisted index from %s", idx_file)
+        if not idx_file.exists():
+            return None
+        try:
+            data = json.loads(idx_file.read_text())
+            return VideoIndex(
+                video_id=data.get("video_id", idx_dir.name),
+                frame_indices=data.get("frame_indices", []),
+                timestamps=data.get("timestamps", []),
+                motion_scores=data.get("motion_scores", []),
+                total_frames=data.get("total_frames", 0),
+                metadata=data.get("metadata", {}),
+                benchmarks=data.get("benchmarks", {}),
+                object_metadata=data.get("object_metadata", []),
+                track_metadata=data.get("track_metadata", {}),
+            )
+        except Exception:
+            logger.exception("Failed loading persisted index from %s", idx_file)
+            return None
+
+    dirs = [d for d in frames_dir.iterdir() if d.is_dir()]
+    if len(dirs) > 1:
+        with ThreadPoolExecutor(max_workers=min(settings.NUM_WORKERS, len(dirs))) as pool:
+            indexes = list(pool.map(_load_one, dirs))
+    else:
+        indexes = [_load_one(d) for d in dirs]
+
+    with _indexes_lock:
+        for vi in indexes:
+            if vi is not None:
+                _indexes[vi.video_id] = vi
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -230,11 +243,11 @@ async def _run_search_with_timeout(req: SearchRequest):
         targets = {req.video_id: _indexes[req.video_id]} if req.video_id and req.video_id in _indexes else dict(_indexes)
     if not targets:
         return JSONResponse(status_code=400, content={"detail": "No videos indexed." if not req.video_id else f"Video {req.video_id} not found.", "segments": []})
-    results = []
-    for video_id, idx in targets.items():
+
+    async def _search_one(video_id: str, idx: VideoIndex) -> list[dict]:
         embs = idx.load_embeddings()
         if embs is None or len(embs) == 0:
-            continue
+            return []
         faiss_idx = idx.get_faiss_index()
         loop = asyncio.get_event_loop()
         indices, scores = await loop.run_in_executor(executor, search_embeddings, req.query, faiss_idx, embs, req.top_k * 2)
@@ -246,7 +259,10 @@ async def _run_search_with_timeout(req: SearchRequest):
             seg["timestamps"] = [idx.timestamps[i] for i in orig]
             seg["avg_score"] = sum(seg["scores"]) / len(seg["scores"]) if seg["scores"] else 0
         segs.sort(key=lambda s: s["avg_score"], reverse=True)
-        results.extend(segs[:req.top_k])
+        return segs[:req.top_k]
+
+    results_lists = await asyncio.gather(*[_search_one(vid, idx) for vid, idx in targets.items()])
+    results = [seg for segs in results_lists for seg in segs]
     results.sort(key=lambda s: s["avg_score"], reverse=True)
     results = results[:req.top_k]
     top_score = results[0]["avg_score"] if results else 0

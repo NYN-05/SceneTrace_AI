@@ -187,6 +187,10 @@ def _get_clip():
                 logger.info("CLIP model loaded")
     return _clip_model, _clip_processor
 
+def _preprocess_batch(batch: list[np.ndarray], processor) -> dict:
+    rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch]
+    return processor(images=rgb, return_tensors="pt", padding=True)
+
 @torch.inference_mode()
 def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 0,
                        progress: dict = None) -> np.ndarray:
@@ -194,10 +198,21 @@ def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 0,
     all_embs = []
     bs = batch_size or settings.BATCH_SIZE
     n_batches = max(1, (len(imgs) + bs - 1) // bs)
+    pool = ThreadPoolExecutor(max_workers=1)
+    preproc_future = None
     for i in range(0, len(imgs), bs):
         batch = imgs[i:i+bs]
-        rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch]
-        inputs = processor(images=rgb, return_tensors="pt", padding=True).to(device)
+        if preproc_future is not None:
+            inputs = preproc_future.result().to(device)
+        else:
+            rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch]
+            inputs = processor(images=rgb, return_tensors="pt", padding=True).to(device)
+        next_i = i + bs
+        if next_i < len(imgs):
+            next_batch = imgs[next_i:next_i+bs]
+            preproc_future = pool.submit(_preprocess_batch, next_batch, processor)
+        else:
+            preproc_future = None
         emb = model.get_image_features(**inputs)
         emb_norm = emb / emb.norm(dim=-1, keepdim=True)
         all_embs.append(emb_norm.cpu().numpy())
@@ -209,6 +224,7 @@ def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 0,
             elapsed = time.time() - progress["_t0"]
             eff = max(pct, 1)
             progress["eta_seconds"] = int(elapsed / eff * (100 - eff))
+    pool.shutdown(wait=False)
     return np.concatenate(all_embs, axis=0).astype("float32")
 
 @torch.inference_mode()
@@ -422,22 +438,27 @@ class MetadataDB:
     def populate(self, object_metadata: list[dict], track_metadata: dict,
                  frame_indices: list[int], timestamps: list[float]):
         frame_to_ts = dict(zip(frame_indices, timestamps))
-        for obj in object_metadata:
-            fi = obj["frame_idx"]
-            b = obj["bbox"]
-            self.conn.execute(
+        objs_data = [
+            (obj["frame_idx"], obj.get("track_id", -1), obj["label"], obj["score"],
+             obj["bbox"][0], obj["bbox"][1], obj["bbox"][2], obj["bbox"][3],
+             frame_to_ts.get(obj["frame_idx"], 0.0))
+            for obj in object_metadata
+        ]
+        if objs_data:
+            self.conn.executemany(
                 "INSERT INTO objects (frame_idx, track_id, class, confidence, "
                 "bbox_x1, bbox_y1, bbox_x2, bbox_y2, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (fi, obj.get("track_id", -1), obj["label"], obj["score"],
-                 b[0], b[1], b[2], b[3], frame_to_ts.get(fi, 0.0)))
-        for tid_str, td in track_metadata.items():
-            self.conn.execute(
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", objs_data)
+        tracks_data = [
+            (int(tid_str), td["class"], td["start_frame"], td["end_frame"],
+             td["total_frames"], td["avg_confidence"], td["displacement"])
+            for tid_str, td in track_metadata.items()
+        ]
+        if tracks_data:
+            self.conn.executemany(
                 "INSERT OR REPLACE INTO tracks "
                 "(track_id, class, start_frame, end_frame, total_frames, avg_confidence, displacement) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (int(tid_str), td["class"], td["start_frame"], td["end_frame"],
-                 td["total_frames"], td["avg_confidence"], td["displacement"]))
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", tracks_data)
         self.conn.commit()
 
     def query_objects(self, class_name: str = None, track_id: int = None,
@@ -657,17 +678,28 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     embs = compute_embeddings(frames, progress=progress)
     t3 = time.time()
 
-    # ── Phase 4: build overlapping clip embeddings ──
+    # ── Phase 4: build overlapping clip embeddings (parallel) ──
     clip_indices: list[list[int]] = []
     clip_embs_list: list[np.ndarray] = []
     w = settings.CLIP_WINDOW_SIZE
     stride = settings.CLIP_STRIDE
-    for i in range(0, max(1, len(keep_frames) - w + 1), stride):
+    r = range(0, max(1, len(keep_frames) - w + 1), stride)
+
+    def _clip_embed(i: int) -> tuple[list[int], np.ndarray]:
         win_frame_idxs = keep_frames[i:i + w]
         win_embs = embs[i:i + w]
         win_motion = motion_scores[i:i + w]
+        return win_frame_idxs, _encode_clip_light(win_embs, win_motion)
+
+    rlist = list(r)
+    if len(rlist) > 4:
+        with ThreadPoolExecutor(max_workers=min(settings.NUM_WORKERS, len(rlist))) as pool:
+            results = list(pool.map(_clip_embed, rlist))
+    else:
+        results = [_clip_embed(i) for i in rlist]
+    for win_frame_idxs, clip_emb in results:
         clip_indices.append(win_frame_idxs)
-        clip_embs_list.append(_encode_clip_light(win_embs, win_motion))
+        clip_embs_list.append(clip_emb)
     clip_embeddings_arr = np.array(clip_embs_list, dtype="float32") if clip_embs_list else np.empty((0, 515), dtype="float32")
     t_clip = time.time()
     if len(clip_embeddings_arr) > 0:
@@ -685,15 +717,37 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         captioner = _get_captioner()
         if captioner is not None:
             caption_texts: list[str] = []
-            for fi_idx, (frame_idx, frame) in enumerate(zip(keep_frames, frames)):
-                try:
-                    cap = captioner.caption(frame)
-                    captions[frame_idx] = cap
-                    caption_texts.append(cap)
-                except Exception:
-                    logger.exception("Caption failed for frame %d", frame_idx)
-                if progress is not None and (fi_idx + 1) % max(1, len(frames) // 5) == 0:
-                    progress["message"] = f"Captioned: {fi_idx+1}/{len(frames)} frames"
+            cap_frames = list(zip(keep_frames, frames))
+            nw = min(settings.NUM_WORKERS, len(cap_frames))
+            if nw > 1:
+                cap_results: list[tuple[int, str | None]] = [(f[0], None) for f in cap_frames]
+                with ThreadPoolExecutor(max_workers=nw) as pool:
+                    fut_map = {pool.submit(captioner.caption, frame): i
+                               for i, (_, frame) in enumerate(cap_frames)}
+                    done = 0
+                    for f in as_completed(fut_map):
+                        i = fut_map[f]
+                        try:
+                            cap_results[i] = (cap_frames[i][0], f.result())
+                        except Exception:
+                            logger.exception("Caption failed for frame %d", cap_frames[i][0])
+                        done += 1
+                        if progress is not None and done % max(1, len(cap_frames) // 5) == 0:
+                            progress["message"] = f"Captioned: {done}/{len(cap_frames)} frames"
+                for frame_idx, cap in cap_results:
+                    if cap is not None:
+                        captions[frame_idx] = cap
+                        caption_texts.append(cap)
+            else:
+                for fi_idx, (frame_idx, frame) in enumerate(cap_frames):
+                    try:
+                        cap = captioner.caption(frame)
+                        captions[frame_idx] = cap
+                        caption_texts.append(cap)
+                    except Exception:
+                        logger.exception("Caption failed for frame %d", frame_idx)
+                    if progress is not None and (fi_idx + 1) % max(1, len(frames) // 5) == 0:
+                        progress["message"] = f"Captioned: {fi_idx+1}/{len(frames)} frames"
             if caption_texts:
                 logger.info("Encoding %d captions...", len(caption_texts))
                 caption_embs = embed_text(caption_texts)
@@ -711,11 +765,30 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     t_od = time.time()
     tracker = SimpleTracker(match_thresh=settings.TRACK_MATCH_THRESHOLD,
                              track_buffer=settings.TRACK_BUFFER)
+    # Phase 1: detect all frames in parallel
+    all_dets: list[list[dict]] = [None] * len(frames)  # type: ignore
+    nw = min(settings.NUM_WORKERS, len(frames))
+    if nw > 1:
+        with ThreadPoolExecutor(max_workers=nw) as pool:
+            fut_map = {pool.submit(detect, frame, settings.INDEX_DETECTION_PROMPTS,
+                                   threshold=settings.INDEX_OBJECT_CONFIDENCE): i
+                       for i, (_, frame) in enumerate(zip(keep_frames, frames))}
+            for f in as_completed(fut_map):
+                i = fut_map[f]
+                try:
+                    all_dets[i] = f.result()
+                except Exception:
+                    all_dets[i] = []
+    else:
+        for i, (_, frame) in enumerate(zip(keep_frames, frames)):
+            try:
+                all_dets[i] = detect(frame, settings.INDEX_DETECTION_PROMPTS,
+                                     threshold=settings.INDEX_OBJECT_CONFIDENCE)
+            except Exception:
+                all_dets[i] = []
+    # Phase 2: track sequentially in frame order
     for fi_idx, (frame_idx, frame) in enumerate(zip(keep_frames, frames)):
-        try:
-            dets = detect(frame, settings.INDEX_DETECTION_PROMPTS, threshold=settings.INDEX_OBJECT_CONFIDENCE)
-        except Exception:
-            dets = []
+        dets = all_dets[fi_idx] or []
         tracked = tracker.update(dets, frame_idx)
         for d in tracked:
             x1, y1, x2, y2 = d["bbox"]
@@ -762,30 +835,57 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
                      captions=captions, clip_indices=clip_indices)
 
     t4 = time.time()
-    faiss_index = build_faiss_index(embs)
+    out_dir = STORAGE / "frames" / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Build all FAISS indexes in parallel (they are independent)
+    faiss_tasks: list[tuple[str, callable]] = [
+        ("main", lambda: (build_faiss_index(embs), idx.save_faiss_index, idx.save_embeddings)),
+    ]
+    if len(object_embs) > 0:
+        faiss_tasks.append(("object", lambda: (build_faiss_index(object_embs), idx.save_object_faiss_index, idx.save_object_embeddings)))
+    if caption_embs is not None and len(caption_embs) > 0:
+        faiss_tasks.append(("caption", lambda: (build_faiss_index(caption_embs), idx.save_caption_faiss_index, idx.save_caption_embeddings)))
+
+    def _build_one(name: str, fn: callable):
+        index, save_index, save_embs = fn()
+        save_index(index)
+        save_embs(None if name == "main" else (object_embs if name == "object" else caption_embs))
+        return name
+
+    # Actually, let me do a simpler pattern: build indexes in parallel, save sequentially after
+    def _build_main():
+        fi = build_faiss_index(embs)
+        idx.save_faiss_index(fi)
+        idx.save_embeddings(embs)
+        return "main"
+    def _build_object():
+        fi = build_faiss_index(object_embs)
+        idx.save_object_faiss_index(fi)
+        idx.save_object_embeddings(object_embs)
+        return "object"
+    def _build_caption():
+        fi = build_faiss_index(caption_embs)
+        idx.save_caption_faiss_index(fi)
+        idx.save_caption_embeddings(caption_embs)
+        return "caption"
+
+    fns = [_build_main]
+    if len(object_embs) > 0:
+        fns.append(_build_object)
+    if caption_embs is not None and len(caption_embs) > 0:
+        fns.append(_build_caption)
+
+    if len(fns) > 1:
+        with ThreadPoolExecutor(max_workers=len(fns)) as pool:
+            list(pool.map(lambda f: f(), fns))
+    else:
+        fns[0]()
+
     tf = time.time()
     logger.info("FAISS index build: %.1fs", tf - t4)
     if progress is not None:
         progress["percent"] = 88
         progress["message"] = "Built FAISS index..."
-
-    out_dir = STORAGE / "frames" / video_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    idx.save_faiss_index(faiss_index)
-    idx.save_embeddings(embs)
-
-    if len(object_embs) > 0:
-        object_faiss_index = build_faiss_index(object_embs)
-        idx.save_object_faiss_index(object_faiss_index)
-        idx.save_object_embeddings(object_embs)
-        logger.info("Object FAISS index built: %d objects in %.1fs", len(object_embs), time.time() - t_oe)
-
-    if caption_embs is not None and len(caption_embs) > 0:
-        caption_faiss_index = build_faiss_index(caption_embs)
-        idx.save_caption_faiss_index(caption_faiss_index)
-        idx.save_caption_embeddings(caption_embs)
-        logger.info("Caption FAISS index built: %d captions in %.1fs",
-                    len(caption_embs), time.time() - t_cap)
 
     if len(clip_embeddings_arr) > 0:
         idx.save_clip_embeddings(clip_embeddings_arr)

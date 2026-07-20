@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from cachetools import TTLCache
 from pipeline import STORAGE, search_embeddings, frames_to_segments, embed_text, MetadataDB
@@ -450,11 +451,16 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
     candidates: list[dict] = []
     object_frame_maps: dict[str, dict[int, list[dict]]] = {}
     object_track_info: dict[str, dict] = {}
+    caption_frame_sims: dict[str, dict[int, float]] = {}
+    clip_frame_sims: dict[str, dict[int, float]] = {}
 
-    for vid, idx in indexes.items():
+    vid_list = list(indexes.items())
+
+    # Run all three independent per-video search loops in parallel
+    def _search_video_semantic(vid: str, idx: VideoIndex) -> list[dict]:
         embs = idx.load_embeddings()
         if embs is None or len(embs) == 0:
-            continue
+            return []
         faiss_idx = idx.get_faiss_index()
         indices, scores = search_embeddings(expanded_query, faiss_idx, embs, top_k * 3)
         segs = frames_to_segments(indices, scores)
@@ -465,44 +471,89 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
             s["timestamps"] = [idx.timestamps[i] for i in orig]
             s["semantic_score"] = sum(s["scores"]) / len(s["scores"]) if s["scores"] else 0
         segs.sort(key=lambda s: s["semantic_score"], reverse=True)
-        candidates.extend(segs[:top_k * 2])
+        return segs[:top_k * 2]
 
-        if enable_detection:
-            # Stage 2: get SQLite frame set for this video
-            sqlite_frames: set[int] | None = None
-            if class_names:
-                sqlite_frames = _filter_by_class_sqlite(vid, class_names)
-            obj_map, trk_info = _search_objects_faiss(
-                expanded_query, vid, idx, top_k,
-                sqlite_frame_set=sqlite_frames,
-            )
-            if obj_map:
-                object_frame_maps[vid] = obj_map
-            if trk_info:
-                object_track_info[vid] = trk_info
+    def _search_video_objects(vid: str, idx: VideoIndex):
+        if not enable_detection:
+            return {}, {}
+        sqlite_frames: set[int] | None = None
+        if class_names:
+            sqlite_frames = _filter_by_class_sqlite(vid, class_names)
+        return _search_objects_faiss(expanded_query, vid, idx, top_k, sqlite_frame_set=sqlite_frames)
 
-    # ── Stage 1b: caption FAISS search per video ──
-    caption_frame_sims: dict[str, dict[int, float]] = {}
-    for vid, idx in indexes.items():
-        cap_sims = _search_captions_faiss(expanded_query, idx)
-        if cap_sims:
-            caption_frame_sims[vid] = cap_sims
+    def _search_video_caption(vid: str, idx: VideoIndex) -> dict[int, float]:
+        return _search_captions_faiss(expanded_query, idx) or {}
 
-    # ── Stage 1c: clip embedding search per video ──
-    clip_frame_sims: dict[str, dict[int, float]] = {}
-    for vid, idx in indexes.items():
-        clip_sims = _search_clip_embeddings(expanded_query, idx)
-        if clip_sims:
-            clip_frame_sims[vid] = clip_sims
+    def _search_video_clip(vid: str, idx: VideoIndex) -> dict[int, float]:
+        return _search_clip_embeddings(expanded_query, idx) or {}
 
-    # ── Stage 3: compute all 6 signals per candidate ──
-    for seg in candidates:
+    n_vids = len(vid_list)
+    if n_vids > 1:
+        sem_results: list[list[dict]] = [[] for _ in range(n_vids)]
+        obj_maps: list[dict[str, dict[int, list[dict]]]] = [{} for _ in range(n_vids)]
+        obj_tracks: list[dict[str, dict]] = [{} for _ in range(n_vids)]
+        cap_results: list[dict[int, float]] = [{} for _ in range(n_vids)]
+        clip_results: list[dict[int, float]] = [{} for _ in range(n_vids)]
+
+        tasks: list[tuple[int, str, str, callable]] = []
+        for i, (vid, idx) in enumerate(vid_list):
+            tasks.append((i, vid, "sem", lambda i=i, vid=vid, idx=idx: sem_results.__setitem__(i, _search_video_semantic(vid, idx))))
+            tasks.append((i, vid, "obj", lambda i=i, vid=vid, idx=idx: (obj_maps.__setitem__(i, {}), obj_tracks.__setitem__(i, {})) or _search_video_objects(vid, idx) and None))
+            tasks.append((i, vid, "cap", lambda i=i, vid=vid, idx=idx: cap_results.__setitem__(i, _search_video_caption(vid, idx))))
+            tasks.append((i, vid, "clip", lambda i=i, vid=vid, idx=idx: clip_results.__setitem__(i, _search_video_clip(vid, idx))))
+
+        # Simpler approach: run each type in parallel with separate pools
+        def _run_sem():
+            for i, (vid, idx) in enumerate(vid_list):
+                sem_results[i] = _search_video_semantic(vid, idx)
+        def _run_obj():
+            for i, (vid, idx) in enumerate(vid_list):
+                om, ot = _search_video_objects(vid, idx)
+                obj_maps[i] = om
+                obj_tracks[i] = ot
+        def _run_cap():
+            for i, (vid, idx) in enumerate(vid_list):
+                cap_results[i] = _search_video_caption(vid, idx)
+        def _run_clip():
+            for i, (vid, idx) in enumerate(vid_list):
+                clip_results[i] = _search_video_clip(vid, idx)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fs = [pool.submit(_run_sem), pool.submit(_run_obj), pool.submit(_run_cap), pool.submit(_run_clip)]
+            for f in as_completed(fs):
+                f.result()
+
+        for i, (vid, _) in enumerate(vid_list):
+            candidates.extend(sem_results[i])
+            if obj_maps[i]:
+                object_frame_maps[vid] = obj_maps[i]
+            if obj_tracks[i]:
+                object_track_info[vid] = obj_tracks[i]
+            if cap_results[i]:
+                caption_frame_sims[vid] = cap_results[i]
+            if clip_results[i]:
+                clip_frame_sims[vid] = clip_results[i]
+    else:
+        for vid, idx in vid_list:
+            candidates.extend(_search_video_semantic(vid, idx))
+            if enable_detection:
+                om, ot = _search_video_objects(vid, idx)
+                if om:
+                    object_frame_maps[vid] = om
+                if ot:
+                    object_track_info[vid] = ot
+            cap_sims = _search_video_caption(vid, idx)
+            if cap_sims:
+                caption_frame_sims[vid] = cap_sims
+            clip_sims = _search_video_clip(vid, idx)
+            if clip_sims:
+                clip_frame_sims[vid] = clip_sims
+
+    # ── Stage 3: compute all 6 signals per candidate (parallel) ──
+    def _score_segment(seg: dict) -> dict:
         mid = seg["frame_indices"][len(seg["frame_indices"]) // 2]
         vid = seg["video_id"]
 
-        # Base semantic score already set above
-
-        # Object match & track consistency from FAISS (or fallback to on-the-fly detection)
         if enable_detection and vid in object_frame_maps and mid in object_frame_maps[vid]:
             objs = object_frame_maps[vid][mid]
             seg["detections"] = objs
@@ -538,11 +589,9 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
             seg["object_score"] = 0
             seg["tracking_consistency"] = 0
 
-        # Annotated thumbnail URL (frontend renders green bboxes from _d.jpg)
         if seg.get("detections"):
             seg["annotated_thumbnail"] = f"/api/frames/{vid}/frame_{mid}_d.jpg"
 
-        # Relationship IoU overlap check (e.g. person+backpack co-occurrence)
         relationships = search_plan.get("relationships", [])
         relationship_iou = 0.0
         if relationships and enable_detection and vid in object_frame_maps and mid in object_frame_maps[vid]:
@@ -557,13 +606,11 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
                             relationship_iou = max(relationship_iou, round(iou, 3))
         seg["relationship_overlap"] = relationship_iou
 
-        # Caption similarity from indexed caption embeddings
         cap_sim = 0.0
         if vid in caption_frame_sims and mid in caption_frame_sims[vid]:
             cap_sim = caption_frame_sims[vid][mid]
         seg["caption_similarity"] = cap_sim
 
-        # Temporal alignment: clip embedding similarity + trajectory analysis
         temp_align = 0.0
         if vid in clip_frame_sims and mid in clip_frame_sims[vid]:
             temp_align = clip_frame_sims[vid][mid]
@@ -577,21 +624,26 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
             temp_align = max(temp_align, traj_score)
         seg["temporal_alignment"] = temp_align
 
-        # Motion signal from indexed motion scores
         motion = _compute_motion_score(mid, indexes[vid])
-        # Adjust motion by action context from search plan
         actions = search_plan.get("actions", [])
         if "stopped" in actions:
-            motion = 1.0 - motion  # invert: low motion → near 1.0
+            motion = 1.0 - motion
         elif "crossing" in actions or "walking" in actions:
-            pass  # keep high motion as-is
+            pass
         seg["motion_activity"] = round(motion, 3)
 
-        # Compute 6-signal weighted score
         w, breakdown = _hybrid_score(seg)
         seg["weighted_score"] = w
         seg["score_breakdown"] = breakdown
         seg["avg_score"] = w
+        return seg
+
+    n_segs = len(candidates)
+    if n_segs > 4:
+        with ThreadPoolExecutor(max_workers=min(settings.NUM_WORKERS, n_segs)) as pool:
+            candidates = list(pool.map(_score_segment, candidates))
+    else:
+        candidates = [_score_segment(s) for s in candidates]
 
     # ── Sort by hybrid score ──
     candidates.sort(key=lambda s: s["weighted_score"], reverse=True)

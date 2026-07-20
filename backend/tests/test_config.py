@@ -17,7 +17,7 @@ def test_defaults():
     assert settings.DETECTION_THRESHOLD == 0.2
     assert settings.GAP_THRESHOLD == 3
     assert settings.MOTION_STRIDE == 3
-    assert settings.BATCH_SIZE == 32
+    assert settings.BATCH_SIZE == 64
     assert settings.NUM_WORKERS == 4
     assert settings.DET_CACHE_MAXSIZE == 5000
     assert settings.DET_CACHE_TTL == 3600

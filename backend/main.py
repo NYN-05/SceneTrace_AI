@@ -24,6 +24,11 @@ from search_engine import search as enhanced_search, suggest as query_suggest
 from config import benchmark
 from config import settings, logger
 
+access_logger = logging.getLogger("scenetrace.access")
+access_logger.setLevel(logging.INFO)
+for h in logging.getLogger().handlers:
+    access_logger.addHandler(h)
+
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
 
@@ -102,6 +107,37 @@ app.add_middleware(
     allow_headers=["Content-Type"],
     allow_credentials=True,
 )
+
+class AccessLogMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        t0 = time.time()
+        method = scope["method"]
+        path = scope["path"]
+        status_code = [None]
+
+        async def wrapped_send(event):
+            if event["type"] == "http.response.start":
+                status_code[0] = event["status"]
+            await send(event)
+
+        try:
+            await self.app(scope, receive, wrapped_send)
+        except Exception:
+            raise
+        finally:
+            if status_code[0] is not None:
+                dt_ms = (time.time() - t0) * 1000
+                if status_code[0] < 400:
+                    access_logger.info("%s %s %s %.0fms", method, path, status_code[0], dt_ms)
+                else:
+                    access_logger.warning("%s %s %s %.0fms", method, path, status_code[0], dt_ms)
+
+app.add_middleware(AccessLogMiddleware)
 
 frames_dir = STORAGE / "frames"
 frames_dir.mkdir(parents=True, exist_ok=True)
@@ -409,4 +445,10 @@ def cleanup_storage(_=Depends(authenticate)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level=settings.LOG_LEVEL.lower())
+    for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+        uv_log = logging.getLogger(name)
+        uv_log.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
+        for h in logging.getLogger().handlers:
+            uv_log.addHandler(h)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level=settings.LOG_LEVEL.lower(), access_log=False)

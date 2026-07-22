@@ -2,7 +2,7 @@ param([string]$VideoPath = "")
 
 $api = "http://localhost:8000/api"
 $pass = $true
-$queryText = "white sports car parked on the street"
+$queryText = "a car driving through the intersection"
 
 function Check {
     param($Name, $Result, $Expected)
@@ -38,7 +38,7 @@ try {
 
 # 2. Video
 if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
-    Write-Host "[2/13] No video found. Usage: .\test_workflow.ps1 -VideoPath T2.mp4" -ForegroundColor Yellow
+    Write-Host "[2/13] No video found. Usage: .\test_workflow.ps1 -VideoPath T1.mp4" -ForegroundColor Yellow
     exit 1
 }
 $fileSize = (Get-Item $VideoPath).Length

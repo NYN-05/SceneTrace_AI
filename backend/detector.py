@@ -40,27 +40,14 @@ class YOLOWorldManager:
     def _load(self, name: str):
         from ultralytics import YOLOWorld
         variant_label = name.capitalize()
-        logger.info("Loading YOLO-World-%s (%s) on %s...", variant_label, self.VARIANTS[name], device)
+        logger.info("Loading YOLO-World-%s (%s)...", variant_label, self.VARIANTS[name])
         model = YOLOWorld(self.VARIANTS[name])
-        _device = device
-        try:
-            for _ in range(2):
-                try:
-                    model.to(_device)
-                    break
-                except RuntimeError as e:
-                    if "meta tensor" in str(e):
-                        model.to_empty(device=_device)
-                        break
-                    raise
-        except Exception:
-            logger.warning("YOLO-World-%s device error, falling back to cpu", variant_label)
-            _device = "cpu"
-            try:
-                model.to("cpu")
-            except Exception:
-                pass
-        logger.info("YOLO-World-%s loaded on %s", variant_label, _device)
+        if _has_meta_tensor(model):
+            _reload_model_weights(model, self.VARIANTS[name], device)
+        _move_to_device(model, device)
+        _purge_meta_tensors(model, device)
+        actual = next(model.parameters(), None)
+        logger.info("YOLO-World-%s loaded on %s", variant_label, actual.device if actual else "?")
         return model
 
     def get(self, name: str = None):
@@ -113,6 +100,48 @@ class YOLOWorldManager:
         raise RuntimeError(f"All YOLO-World variants failed — {last_error}")
 
 
+def _reload_model_weights(model, variant_name: str, target_device: str):
+    import ultralytics.utils.downloads
+    ckpt_path = ultralytics.utils.downloads.attempt_download_asset(variant_name)
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    model.to_empty(device=target_device)
+    raw = ckpt.get("model", ckpt)
+    if isinstance(raw, dict):
+        model.model.load_state_dict(raw, strict=False)
+    elif hasattr(raw, "state_dict"):
+        model.model.load_state_dict(raw.state_dict(), strict=False)
+
+
+def _move_to_device(module: torch.nn.Module, target: str):
+    if _has_meta_tensor(module):
+        return
+    for p in module.parameters(recurse=True):
+        if p.device.type != target.split(":")[0]:
+            p.data = p.data.to(target)
+    for b in module.buffers(recurse=True):
+        if b.device.type != target.split(":")[0]:
+            b.data = b.data.to(target)
+
+
+def _has_meta_tensor(module: torch.nn.Module) -> bool:
+    for p in module.parameters():
+        if p.device.type == "meta":
+            return True
+    for b in module.buffers():
+        if b.device.type == "meta":
+            return True
+    return False
+
+
+def _purge_meta_tensors(module: torch.nn.Module, target: str):
+    for p in module.parameters(recurse=True):
+        if p.device.type == "meta":
+            p.data = torch.empty(p.size(), dtype=p.dtype, device=target)
+    for b in module.buffers(recurse=True):
+        if b.device.type == "meta":
+            b.data = torch.empty(b.size(), dtype=b.dtype, device=target)
+
+
 _yolo_manager = None
 
 
@@ -137,8 +166,7 @@ def _load_grounding_dino():
     logger.info("Loading Grounding DINO on %s...", device)
     _detector = AutoModelForZeroShotObjectDetection.from_pretrained(
         settings.DETECTOR_MODEL_NAME,
-        device_map=device,
-    ).eval()
+    ).eval().to(device)
     _processor = AutoProcessor.from_pretrained(settings.DETECTOR_MODEL_NAME)
     logger.info("Grounding DINO loaded")
 

@@ -31,6 +31,7 @@ class YOLOWorldManager:
         self.default = default_variant
         self._models = {}
         self._current = None
+        self._load_lock = threading.Lock()
 
     @property
     def current_variant(self):
@@ -41,14 +42,32 @@ class YOLOWorldManager:
         variant_label = name.capitalize()
         logger.info("Loading YOLO-World-%s (%s) on %s...", variant_label, self.VARIANTS[name], device)
         model = YOLOWorld(self.VARIANTS[name])
-        model.to(device)
-        logger.info("YOLO-World-%s loaded", variant_label)
+        _device = device
+        try:
+            for _ in range(2):
+                try:
+                    model.to(_device)
+                    break
+                except RuntimeError as e:
+                    if "meta tensor" in str(e):
+                        model.to_empty(device=_device)
+                        break
+                    raise
+        except Exception:
+            logger.warning("YOLO-World-%s device error, falling back to cpu", variant_label)
+            _device = "cpu"
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+        logger.info("YOLO-World-%s loaded on %s", variant_label, _device)
         return model
 
     def get(self, name: str = None):
         name = name or self.default
-        if name not in self._models:
-            self._models[name] = self._load(name)
+        with self._load_lock:
+            if name not in self._models:
+                self._models[name] = self._load(name)
         return self._models[name]
 
     def detect(self, image: np.ndarray, text: str, threshold: float) -> list[dict]:
@@ -117,8 +136,9 @@ def _load_grounding_dino():
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
     logger.info("Loading Grounding DINO on %s...", device)
     _detector = AutoModelForZeroShotObjectDetection.from_pretrained(
-        settings.DETECTOR_MODEL_NAME
-    ).to(device).eval()
+        settings.DETECTOR_MODEL_NAME,
+        device_map=device,
+    ).eval()
     _processor = AutoProcessor.from_pretrained(settings.DETECTOR_MODEL_NAME)
     logger.info("Grounding DINO loaded")
 

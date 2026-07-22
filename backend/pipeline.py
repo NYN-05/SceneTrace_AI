@@ -182,7 +182,7 @@ def _get_clip():
         with _clip_lock:
             if _clip_model is None:
                 logger.info("Loading CLIP model on %s...", device)
-                _clip_model = CLIPModel.from_pretrained(settings.CLIP_MODEL_NAME).to(device).eval()
+                _clip_model = CLIPModel.from_pretrained(settings.CLIP_MODEL_NAME, device_map=device).eval()
                 _clip_processor = CLIPProcessor.from_pretrained(settings.CLIP_MODEL_NAME)
                 logger.info("CLIP model loaded")
     return _clip_model, _clip_processor
@@ -284,8 +284,9 @@ class Captioner:
         self._processor = AutoProcessor.from_pretrained(
             self.model_name, trust_remote_code=True)
         self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, trust_remote_code=True
-        ).to(device).eval()
+            self.model_name, trust_remote_code=True,
+            device_map=device,
+        ).eval()
         logger.info("Captioner loaded")
 
     def caption(self, image: np.ndarray) -> str:

@@ -1,0 +1,27 @@
+=== T1.mp4 — Traffic intersection (cars, buses, pedestrians) ===
+a car driving through the intersection
+a bus stopped at the traffic light
+a person walking across the crosswalk
+a traffic light turning green
+busy traffic at the intersection
+
+=== T2.mp4 — City street traffic ===
+a car driving down the street
+a truck moving in traffic
+heavy traffic on the road
+cars on a city street
+a busy road with vehicles
+
+=== T3.mp4 — City street with cars and buildings ===
+a car parked on the street
+a tall building in the city
+a street lined with buildings
+a city scene with traffic
+an urban street with cars
+
+=== T4.mp4 — People walking on busy city street ===
+a person walking on the sidewalk
+people walking in the city
+people walking down the street
+a crowd of people on the street
+pedestrians crossing the road

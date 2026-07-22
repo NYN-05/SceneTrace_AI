@@ -15,7 +15,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from cachetools import TTLCache
-from pipeline import STORAGE, search_embeddings, frames_to_segments, embed_text, MetadataDB
+from pipeline import STORAGE, VideoIndex, search_embeddings, frames_to_segments, embed_text, MetadataDB
 from config import benchmark, settings
 
 logger = logging.getLogger("scenetrace.search")

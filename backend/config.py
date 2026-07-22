@@ -1,9 +1,12 @@
 import os
 import logging
+import logging.handlers
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 class Settings:
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:5173")
@@ -11,6 +14,7 @@ class Settings:
     RATE_LIMIT: str = os.getenv("RATE_LIMIT", "20/minute")
     STORAGE_DIR: Path = Path(os.getenv("STORAGE_DIR", str(Path(__file__).parent / "storage")))
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    LOG_FILE: str = os.getenv("LOG_FILE", str(PROJECT_ROOT / "server.log"))
     DEVICE: str = os.getenv("DEVICE", "")
 
     CLIP_MODEL_NAME: str = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch32")
@@ -82,10 +86,21 @@ class Settings:
 
 settings = Settings()
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+_root_logger.addHandler(_console)
+
+_log_path = Path(settings.LOG_FILE)
+_log_path.parent.mkdir(parents=True, exist_ok=True)
+_file = logging.handlers.RotatingFileHandler(str(_log_path), maxBytes=10*1024*1024, backupCount=3, encoding="utf-8")
+_file.setFormatter(_fmt)
+_root_logger.addHandler(_file)
+
 logger = logging.getLogger("scenetrace")
 
 # ---- Thread-safe performance benchmark ----

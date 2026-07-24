@@ -8,6 +8,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
@@ -16,7 +17,7 @@ try:
 except ImportError:
     pass
 
-from config import settings, logger
+from config import logger, settings
 
 
 def _download_model(model_id: str, model_type: str):
@@ -28,7 +29,7 @@ def _download_model(model_id: str, model_type: str):
     elif model_type == "dino":
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
         AutoModelForZeroShotObjectDetection.from_pretrained(
-            model_id, resume_download=True, ignore_mismatched_sizes=False
+            model_id, resume_download=True, ignore_mismatched_sizes=False,
         )
         AutoProcessor.from_pretrained(model_id, resume_download=True)
     logger.info("%s model cached (%s)", model_type, model_id)
@@ -38,7 +39,7 @@ def _preload_yolo_world(variant: str):
     logger.info("Downloading YOLO-World-%s ...", variant.capitalize())
     from ultralytics import YOLOWorld
     model_ids = {"large": "yolov8l-world.pt", "medium": "yolov8m-world.pt", "small": "yolov8s-world.pt"}
-    model = YOLOWorld(model_ids[variant])
+    YOLOWorld(model_ids[variant])
     logger.info("YOLO-World-%s cached", variant.capitalize())
 
 

@@ -1,5 +1,6 @@
 """Download Florence-2 model with unlimited timeout."""
 import os
+
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "999999"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "999999"
 os.environ["TRANSFORMERS_OFFLINE"] = "0"

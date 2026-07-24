@@ -3,7 +3,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from search_engine import suggest, _compute_iou, _extract_class_names, _extract_search_plan
+from search_engine import (
+    _compute_iou,
+    _extract_class_names,
+    _extract_search_plan,
+    suggest,
+)
 
 
 class TestSuggest:

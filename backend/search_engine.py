@@ -6,23 +6,66 @@ Multi-stage pipeline (Phase 5):
   Stage 3 — 6-signal hybrid scoring with configurable weights
   Stage 4 — Cross-encoder reranker (optional)
 """
+import logging
 import math
 import re
+import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import cv2
 import numpy as np
-import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from cachetools import TTLCache
-from pipeline import STORAGE, VideoIndex, search_embeddings, frames_to_segments, embed_text, MetadataDB
 from config import benchmark, settings
+from pipeline import (
+    STORAGE,
+    VideoIndex,
+    embed_text,
+    frames_to_segments,
+    search_embeddings,
+)
 
 logger = logging.getLogger("scenetrace.search")
 
 _RERANKER_LOCK = threading.Lock()
 _RERANKER_MODEL = None
+
+_QUERY_EMB_CACHE: dict[str, np.ndarray] = {}
+_QUERY_EMB_CACHE_LOCK = threading.Lock()
+_QUERY_EMB_CACHE_MAX = 64
+
+def _get_query_embedding(query: str) -> np.ndarray:
+    with _QUERY_EMB_CACHE_LOCK:
+        if query in _QUERY_EMB_CACHE:
+            return _QUERY_EMB_CACHE[query]
+    emb = embed_text([query])
+    with _QUERY_EMB_CACHE_LOCK:
+        if len(_QUERY_EMB_CACHE) >= _QUERY_EMB_CACHE_MAX:
+            _QUERY_EMB_CACHE.clear()
+        _QUERY_EMB_CACHE[query] = emb
+    return emb
+
+_SQLITE_CONN_CACHE: dict[str, sqlite3.Connection] = {}
+_SQLITE_CONN_CACHE_LOCK = threading.Lock()
+
+def _get_cached_sqlite(vid: str) -> sqlite3.Connection | None:
+    db_path = STORAGE / "frames" / vid / "metadata.db"
+    if not db_path.exists():
+        return None
+    with _SQLITE_CONN_CACHE_LOCK:
+        if vid in _SQLITE_CONN_CACHE:
+            conn = _SQLITE_CONN_CACHE[vid]
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except Exception:
+                pass
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        _SQLITE_CONN_CACHE[vid] = conn
+        return conn
 
 # ── Stage 4: Cross-encoder reranker ──────────────────────────
 
@@ -103,16 +146,16 @@ def _extract_class_names(query: str) -> list[str]:
 def _filter_by_class_sqlite(vid: str, class_names: list[str],
                             min_confidence: float = 0.0) -> set[int] | None:
     """Return set of frame_idx containing *any* class_name (from SQLite), or None if no DB."""
-    db_path = STORAGE / "frames" / vid / "metadata.db"
-    if not db_path.exists():
+    conn = _get_cached_sqlite(vid)
+    if conn is None:
         return None
     try:
-        mdb = MetadataDB(db_path)
         frames: set[int] = set()
         for cls in class_names:
-            rows = mdb.query_objects(class_name=cls, min_confidence=min_confidence)
+            rows = conn.execute(
+                "SELECT frame_idx FROM objects WHERE class = ? AND confidence >= ?",
+                (cls, min_confidence)).fetchall()
             frames.update(r["frame_idx"] for r in rows)
-        mdb.close()
         return frames
     except Exception:
         logger.exception("SQLite filter failed for %s", vid)
@@ -122,26 +165,26 @@ def _filter_by_class_sqlite(vid: str, class_names: list[str],
 # ── Phase 3: Query parser (regex) ─────────────────────────────
 
 _ATTR_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"(\w+)\s+car\b", re.I), "car"),
-    (re.compile(r"(\w+)\s+(person|man|woman|child)\b", re.I), "person"),
-    (re.compile(r"(\w+)\s+(truck|van|bus|bicycle|motorcycle)\b", re.I), None),
-    (re.compile(r"(\w+)\s+dog\b", re.I), "dog"),
-    (re.compile(r"(\w+)\s+cat\b", re.I), "cat"),
+    (re.compile(r"(\w+)\s+car\b", re.IGNORECASE), "car"),
+    (re.compile(r"(\w+)\s+(person|man|woman|child)\b", re.IGNORECASE), "person"),
+    (re.compile(r"(\w+)\s+(truck|van|bus|bicycle|motorcycle)\b", re.IGNORECASE), None),
+    (re.compile(r"(\w+)\s+dog\b", re.IGNORECASE), "dog"),
+    (re.compile(r"(\w+)\s+cat\b", re.IGNORECASE), "cat"),
 ]
 
 _LOCATION_PATTERNS: list[re.Pattern] = [
-    re.compile(r"(near|at|by|beside)\s+the\s+(\w+)", re.I),
-    re.compile(r"\b(entrance|exit|door|gate|intersection|crosswalk|sidewalk|driveway|parking)", re.I),
-    re.compile(r"\b(street|road|highway|path|corner|stairs|elevator|lobby)\b", re.I),
+    re.compile(r"(near|at|by|beside)\s+the\s+(\w+)", re.IGNORECASE),
+    re.compile(r"\b(entrance|exit|door|gate|intersection|crosswalk|sidewalk|driveway|parking)", re.IGNORECASE),
+    re.compile(r"\b(street|road|highway|path|corner|stairs|elevator|lobby)\b", re.IGNORECASE),
 ]
 
 _ACTION_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b(walk(ing)?|runs?|running)\b", re.I), "walking"),
-    (re.compile(r"\b(driv(ing|es?)|cross(ing|es)?)\b", re.I), "crossing"),
-    (re.compile(r"\b(park(ed|ing)?|stop(ped|ing)?|stationary)\b", re.I), "stopped"),
-    (re.compile(r"\b(carr(y|ies|ing)|hold(ing)?|with)\b", re.I), "carrying"),
-    (re.compile(r"\b(toward|approach(ing)?|coming)\b", re.I), "walking_toward"),
-    (re.compile(r"\b(turn(ing|s|ed)?|rotate?|rotating)\b", re.I), "turning"),
+    (re.compile(r"\b(walk(ing)?|runs?|running)\b", re.IGNORECASE), "walking"),
+    (re.compile(r"\b(driv(ing|es?)|cross(ing|es)?)\b", re.IGNORECASE), "crossing"),
+    (re.compile(r"\b(park(ed|ing)?|stop(ped|ing)?|stationary)\b", re.IGNORECASE), "stopped"),
+    (re.compile(r"\b(carr(y|ies|ing)|hold(ing)?|with)\b", re.IGNORECASE), "carrying"),
+    (re.compile(r"\b(toward|approach(ing)?|coming)\b", re.IGNORECASE), "walking_toward"),
+    (re.compile(r"\b(turn(ing|s|ed)?|rotate?|rotating)\b", re.IGNORECASE), "turning"),
 ]
 
 
@@ -154,6 +197,7 @@ def _extract_search_plan(query: str) -> dict:
         location: str or None
         actions: list of action types
         relationships: list of {obj_a, obj_b} pairs (e.g. person+backpack co-occurrence)
+
     """
     q = query.lower()
     objects = list(_extract_class_names(query))
@@ -246,6 +290,7 @@ def _save_annotated_thumbnail(vid: str, frame_idx: int, detections: list[dict]):
 def _search_objects_faiss(query: str, vid: str, idx,
                           top_k: int = 15,
                           sqlite_frame_set: set[int] | None = None,
+                          q_emb: np.ndarray | None = None,
                           ) -> tuple[dict[int, list[dict]], dict]:
     """Query object FAISS → (frame_map, track_info).
 
@@ -263,7 +308,7 @@ def _search_objects_faiss(query: str, vid: str, idx,
         obj_embs = obj_embs[:n_meta]
     else:
         obj_meta = idx.object_metadata
-    q_emb = embed_text([query])
+    q_emb = q_emb if q_emb is not None else embed_text([query])
     n = len(obj_embs)
     scores, indices = obj_faiss.search(q_emb, min(top_k * 3, n))
     frame_map: dict[int, list[dict]] = {}
@@ -321,13 +366,13 @@ def _compute_motion_score(mid_frame: int, idx) -> float:
     return 0.0
 
 
-def _search_captions_faiss(query: str, idx) -> dict[int, float]:
+def _search_captions_faiss(query: str, idx, q_emb: np.ndarray | None = None) -> dict[int, float]:
     """Search caption FAISS → {frame_idx: caption_similarity}."""
     cap_embs = idx.load_caption_embeddings()
     cap_faiss = idx.get_caption_faiss_index()
     if cap_faiss is None or cap_embs is None or len(cap_embs) == 0:
         return {}
-    q_emb = embed_text([query])
+    q_emb = q_emb if q_emb is not None else embed_text([query])
     n = len(cap_embs)
     scores, indices = cap_faiss.search(q_emb, min(50, n))
     frame_to_sim: dict[int, float] = {}
@@ -344,7 +389,7 @@ def _search_captions_faiss(query: str, idx) -> dict[int, float]:
     return frame_to_sim
 
 
-def _search_clip_embeddings(query: str, idx) -> dict[int, float]:
+def _search_clip_embeddings(query: str, idx, q_emb: np.ndarray | None = None) -> dict[int, float]:
     """Linear search of clip embeddings → {frame_idx: temporal_score}.
 
     Each clip covers a sliding window of keyframes; the score is assigned
@@ -354,7 +399,7 @@ def _search_clip_embeddings(query: str, idx) -> dict[int, float]:
     clip_embs = idx.load_clip_embeddings()
     if clip_embs is None or len(clip_embs) == 0 or not idx.clip_indices:
         return {}
-    q_emb = embed_text([query])
+    q_emb = q_emb if q_emb is not None else embed_text([query])
     if clip_embs.shape[1] == 515 and q_emb.shape[1] == 512:
         clip_embs = clip_embs[:, :512].copy()
     sims = np.dot(clip_embs, q_emb.T).flatten()
@@ -467,7 +512,9 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
     if attrs:
         expanded_query = query + " " + " ".join(f"{v} {k}" for k, v in attrs.items())
 
-    # ── Stage 1: FAISS semantic retrieval per video ──
+    # ── Compute text embedding once for all search paths ──
+    q_emb = _get_query_embedding(expanded_query)
+
     candidates: list[dict] = []
     object_frame_maps: dict[str, dict[int, list[dict]]] = {}
     object_track_info: dict[str, dict] = {}
@@ -482,7 +529,7 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
         if embs is None or len(embs) == 0:
             return []
         faiss_idx = idx.get_faiss_index()
-        indices, scores = search_embeddings(expanded_query, faiss_idx, embs, top_k * 3)
+        indices, scores = search_embeddings(expanded_query, faiss_idx, embs, top_k * 3, q_emb=q_emb)
         paired = sorted(zip(indices, scores), key=lambda x: idx.frame_indices[x[0]])
         sorted_idx, sorted_sc = zip(*paired) if paired else ([], [])
         segs = frames_to_segments(list(sorted_idx), list(sorted_sc))
@@ -501,13 +548,13 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
         sqlite_frames: set[int] | None = None
         if class_names:
             sqlite_frames = _filter_by_class_sqlite(vid, class_names)
-        return _search_objects_faiss(expanded_query, vid, idx, top_k, sqlite_frame_set=sqlite_frames)
+        return _search_objects_faiss(expanded_query, vid, idx, top_k, sqlite_frame_set=sqlite_frames, q_emb=q_emb)
 
-    def _search_video_caption(vid: str, idx: VideoIndex) -> dict[int, float]:
-        return _search_captions_faiss(expanded_query, idx) or {}
+    def _search_video_caption(_vid: str, idx: VideoIndex) -> dict[int, float]:
+        return _search_captions_faiss(expanded_query, idx, q_emb=q_emb) or {}
 
-    def _search_video_clip(vid: str, idx: VideoIndex) -> dict[int, float]:
-        return _search_clip_embeddings(expanded_query, idx) or {}
+    def _search_video_clip(_vid: str, idx: VideoIndex) -> dict[int, float]:
+        return _search_clip_embeddings(expanded_query, idx, q_emb=q_emb) or {}
 
     n_vids = len(vid_list)
     if n_vids > 1:
@@ -574,7 +621,7 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
             _save_annotated_thumbnail(vid, mid, objs)
             sims = [o["clip_similarity"] for o in objs]
             seg["object_score"] = round(sum(sims) / len(sims), 4) if sims else 0
-            tids = set(o.get("track_id", -1) for o in objs if o.get("track_id", -1) >= 0)
+            tids = {o.get("track_id", -1) for o in objs if o.get("track_id", -1) >= 0}
             seg["track_ids"] = tids
             if tids and vid in object_track_info:
                 trk_scores = []
@@ -709,6 +756,6 @@ def suggest(text: str) -> list[str]:
             f"person {text}",
             f"{text} near entrance",
             f"{text} moving",
-            f"find {text}"
+            f"find {text}",
         ]
     return results[:6]

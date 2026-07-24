@@ -2,49 +2,58 @@ import { useState, useCallback, useRef, useEffect } from "react";
 
 const API = "";
 
+const MAX_LOG_ENTRIES = 50;
+
 export function useUpload() {
   const [status, setStatus] = useState("");
   const [logs, setLogs] = useState([]);
   const [indexProgress, setIndexProgress] = useState(null);
   const [indexStartTime, setIndexStartTime] = useState(null);
   const [lastVideoId, setLastVideoId] = useState(null);
-  const pollingRef = useRef(null);
+  const sseRef = useRef(null);
   const fileRef = useRef(null);
 
   useEffect(() => {
     return () => {
-      if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+      if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
     };
   }, []);
 
-  const log = useCallback((msg) => setLogs((p) => [...p, msg]), []);
+  const log = useCallback((msg) => setLogs((p) => {
+    if (p.length >= MAX_LOG_ENTRIES) return [...p.slice(-(MAX_LOG_ENTRIES - 1)), msg];
+    return [...p, msg];
+  }), []);
 
-  const stopPolling = useCallback(() => {
-    if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+  const stopSSE = useCallback(() => {
+    if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
   }, []);
 
-  const pollProgress = useCallback((videoId, onDone) => {
-    stopPolling();
-    pollingRef.current = setInterval(async () => {
+  const connectSSE = useCallback((videoId, onDone) => {
+    stopSSE();
+    const es = new EventSource(`${API}/api/videos/${videoId}/index-progress/stream`);
+    sseRef.current = es;
+    es.onmessage = (event) => {
       try {
-        const r = await fetch(`${API}/api/videos/${videoId}/index-progress`);
-        if (!r.ok) { stopPolling(); setStatus("Error"); setIndexProgress(null); return; }
-        const p = await r.json();
+        const p = JSON.parse(event.data);
         setIndexProgress(p);
         if (p.stage === "done" || p.stage === "error" || p.percent >= 100) {
-          stopPolling();
+          es.close(); sseRef.current = null;
           setIndexProgress(null); setIndexStartTime(null);
           if (p.stage === "done") { setStatus(`Ready - ${p.keyframes || "?"} keyframes`); log(`Indexed: ${p.keyframes || "?"} keyframes`); onDone?.(); }
           else { setStatus(`Error: ${p.message}`); log(`Index error: ${p.message}`); }
         }
-      } catch { stopPolling(); setStatus("Polling failed"); setIndexProgress(null); }
-    }, 800);
-  }, [stopPolling, log]);
+      } catch {}
+    };
+    es.onerror = () => {
+      es.close(); sseRef.current = null;
+      setStatus("Connection lost"); setIndexProgress(null);
+    };
+  }, [stopSSE, log]);
 
   const upload = useCallback(async (onDone) => {
     const file = fileRef.current?.files?.[0];
     if (!file) return;
-    stopPolling(); setStatus("Uploading..."); setIndexProgress(null); setIndexStartTime(null);
+    stopSSE(); setStatus("Uploading..."); setIndexProgress(null); setIndexStartTime(null);
     try {
       const form = new FormData(); form.append("file", file);
       const r = await fetch(`${API}/api/videos/upload`, { method: "POST", body: form });
@@ -56,9 +65,9 @@ export function useUpload() {
       const r2 = await fetch(`${API}/api/videos/${data.video_id}/index`, { method: "POST" });
       if (!r2.ok) throw new Error(`Index start failed: ${r2.status}`);
       setIndexStartTime(Date.now());
-      pollProgress(data.video_id, onDone);
+      connectSSE(data.video_id, onDone);
     } catch (e) { setStatus(`Error: ${e.message}`); log(`Error: ${e.message}`); }
-  }, [stopPolling, pollProgress, log]);
+  }, [stopSSE, connectSSE, log]);
 
   const clearLastVideo = useCallback(() => setLastVideoId(null), []);
 
@@ -72,9 +81,21 @@ export function useSearch() {
   const [suggestions, setSuggestions] = useState([]);
   const [hasSearched, setHasSearched] = useState(false);
   const searchInputRef = useRef(null);
+  const abortRef = useRef(null);
+  const debounceRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, []);
 
   const doSearch = useCallback(async (q, useV2 = true, videoId = null) => {
     if (!q) return;
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setSearching(true); setResults(null); setSuggestions([]); setHasSearched(true);
     try {
       const endpoint = useV2 ? "/api/v2/search" : "/api/search";
@@ -84,27 +105,33 @@ export function useSearch() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
       if (!r.ok) throw new Error(`Search failed: ${r.status}`);
       const data = await r.json();
-      setResults(data);
-    } catch (e) { console.error(e); }
-    setSearching(false);
+      if (!controller.signal.aborted) setResults(data);
+    } catch (e) {
+      if (e.name !== "AbortError") console.error(e);
+    }
+    if (!controller.signal.aborted) setSearching(false);
   }, []);
 
-  const handleInputChange = useCallback(async (e) => {
+  const handleInputChange = useCallback((e) => {
     const val = e.target.value;
     setQuery(val);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
     if (val.length >= 2) {
-      try {
-        const r = await fetch(`${API}/api/search/suggest`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: val, top_k: 3 }),
-        });
-        if (r.ok) { const d = await r.json(); setSuggestions(d.suggestions || []); }
-        else setSuggestions([]);
-      } catch { setSuggestions([]); }
+      debounceRef.current = setTimeout(async () => {
+        try {
+          const r = await fetch(`${API}/api/search/suggest`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: val, top_k: 3 }),
+          });
+          if (r.ok) { const d = await r.json(); setSuggestions(d.suggestions || []); }
+          else setSuggestions([]);
+        } catch { setSuggestions([]); }
+      }, 250);
     } else setSuggestions([]);
   }, []);
 

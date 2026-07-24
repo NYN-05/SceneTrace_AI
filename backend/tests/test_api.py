@@ -1,13 +1,9 @@
 import sys
-import json
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pytest
 from fastapi.testclient import TestClient
-
 from main import app
 
 client = TestClient(app)
@@ -26,14 +22,14 @@ def test_upload_no_file():
 def test_upload_invalid_extension():
     resp = client.post(
         "/api/videos/upload",
-        files={"file": ("test.txt", b"hello", "text/plain")}
+        files={"file": ("test.txt", b"hello", "text/plain")},
     )
     assert resp.status_code == 400
 
 def test_upload_empty_file():
     resp = client.post(
         "/api/videos/upload",
-        files={"file": ("empty.mp4", b"", "video/mp4")}
+        files={"file": ("empty.mp4", b"", "video/mp4")},
     )
     assert resp.status_code == 400
 

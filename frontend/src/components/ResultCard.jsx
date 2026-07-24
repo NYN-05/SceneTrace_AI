@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import ScoreBar from "./ScoreBar";
 
 const API = "";
 
 function cls(...args) { return args.filter(Boolean).join(" "); }
 
-export default function ResultCard({ seg, index }) {
+const ResultCard = memo(function ResultCard({ seg, index }) {
   const [expanded, setExpanded] = useState(false);
   const vid = seg.video_id;
   const midFrame = seg.frame_indices?.[Math.floor((seg.frame_indices?.length || 1) / 2)];
@@ -30,7 +30,7 @@ export default function ResultCard({ seg, index }) {
       <div className="flex flex-col sm:flex-row">
         <div className="relative w-full sm:w-48 h-32 sm:h-auto bg-gray-800 flex-shrink-0">
           {thumbSrc && (
-            <img src={hasDetections ? detSrc : thumbSrc} alt=""
+            <img src={hasDetections ? detSrc : thumbSrc} alt="" loading="lazy"
               className="w-full h-full object-cover"
               onError={(e) => { e.target.style.display = "none" }} />
           )}
@@ -99,4 +99,6 @@ export default function ResultCard({ seg, index }) {
       </div>
     </div>
   );
-}
+});
+
+export default ResultCard;

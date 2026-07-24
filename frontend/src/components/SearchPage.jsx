@@ -1,8 +1,12 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import ResultCard from "./ResultCard";
 import ProgressBar from "./ProgressBar";
 
 function cls(...args) { return args.filter(Boolean).join(" "); }
+
+const LogItem = memo(function LogItem({ msg }) {
+  return <div>{msg}</div>;
+});
 
 const exampleQueries = [
   "person walking near entrance", "red car driving",
@@ -63,7 +67,7 @@ export default function SearchPage({
           )}
           {uploadLogs.length > 0 && (
             <div className="mt-2 text-xs font-mono text-gray-600 max-h-16 overflow-y-auto space-y-0.5">
-              {uploadLogs.map((l, i) => <div key={i}>{l}</div>)}
+              {uploadLogs.map((l, i) => <LogItem key={i} msg={l} />)}
             </div>
           )}
         </div>

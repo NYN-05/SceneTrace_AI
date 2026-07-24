@@ -3,12 +3,14 @@ or Grounding DINO.
 Set DETECTOR_BACKEND=grounding_dino in .env to use Grounding DINO instead.
 YOLO-World fallback chain: Large -> Medium -> Small.
 """
+import threading
+from collections import OrderedDict
+from typing import ClassVar
+
 import cv2
 import numpy as np
 import torch
-import threading
-from collections import OrderedDict
-from config import settings, logger
+from config import logger, settings
 
 device = settings.DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,7 +31,7 @@ _YOLO_FILE_MAP = {
 
 
 class YOLOWorldManager:
-    VARIANTS = OrderedDict()
+    VARIANTS: ClassVar[OrderedDict] = OrderedDict()
     for _v in settings.YOLO_WORLD_FALLBACKS.split(","):
         _v = _v.strip()
         if _v in _YOLO_FILE_MAP:
@@ -115,7 +117,8 @@ class YOLOWorldManager:
                 last_error = exc
                 logger.warning("YOLO-World-%s failed: %s", name.capitalize(), exc)
 
-        raise RuntimeError(f"All YOLO-World variants failed — {last_error}")
+        msg = f"All YOLO-World variants failed — {last_error}"
+        raise RuntimeError(msg)
 
 
 def _reload_model_weights(model, variant_name: str, target_device: str):
@@ -145,13 +148,9 @@ def _move_to_device(module: torch.nn.Module, target: str):
 
 
 def _has_meta_tensor(module: torch.nn.Module) -> bool:
-    for p in module.parameters():
-        if p.device.type == "meta":
-            return True
-    for b in module.buffers():
-        if b.device.type == "meta":
-            return True
-    return False
+    if any(p.device.type == "meta" for p in module.parameters()):
+        return True
+    return any(b.device.type == "meta" for b in module.buffers())
 
 
 def _purge_meta_tensors(module: torch.nn.Module, target: str):
@@ -202,7 +201,7 @@ def _detect_grounding_dino(image: np.ndarray, text: str, threshold: float) -> li
     h, w = image.shape[:2]
     target = torch.tensor([[w, h]], device=device)
     results = _processor.post_process_grounded_object_detection(
-        outputs, threshold=thresh, target_sizes=target, text_labels=[texts]
+        outputs, threshold=thresh, target_sizes=target, text_labels=[texts],
     )[0]
     dets = []
     for box, score, label in zip(results["boxes"], results["scores"], results["labels"]):

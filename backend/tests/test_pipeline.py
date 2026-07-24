@@ -1,14 +1,18 @@
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
-import pytest
 from pipeline import (
-    frames_to_segments, parse_query, build_faiss_index, embed_text, _motion_score_diff,
-    _encode_clip_light, SimpleTracker, MetadataDB
+    MetadataDB,
+    SimpleTracker,
+    _encode_clip_light,
+    _motion_score_diff,
+    build_faiss_index,
+    embed_text,
+    frames_to_segments,
+    parse_query,
 )
 
 

@@ -1,4 +1,9 @@
-import sys, os, json, time, urllib.request, urllib.error, io, mimetypes
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 API = "http://localhost:8000/api"
@@ -26,19 +31,19 @@ def post_json(url, body):
     return json.loads(urllib.request.urlopen(req, timeout=120).read())
 
 def upload_video(path):
-    boundary = b'----Boundary' + os.urandom(16).hex().encode()
-    with open(path, 'rb') as f:
+    boundary = b"----Boundary" + os.urandom(16).hex().encode()
+    with Path(path).open("rb") as f:
         file_data = f.read()
-    filename = os.path.basename(path).encode()
+    filename = Path(path).name.encode()
     body = (
-        b'--' + boundary + b'\r\n'
+        b"--" + boundary + b'\r\n'
         b'Content-Disposition: form-data; name="file"; filename="' + filename + b'"\r\n'
         b'Content-Type: video/mp4\r\n\r\n' + file_data +
-        b'\r\n--' + boundary + b'--\r\n'
+        b"\r\n--" + boundary + b"--\r\n"
     )
     req = urllib.request.Request(f"{API}/videos/upload", data=body)
-    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary.decode()}')
-    return json.loads(urllib.request.urlopen(req).read())['video_id']
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary.decode()}")
+    return json.loads(urllib.request.urlopen(req).read())["video_id"]
 
 def fetch(url, timeout=10):
     return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
@@ -79,10 +84,11 @@ except Exception as e:
 print("[4/13] Indexing (async, polling progress)...")
 start = time.time()
 try:
-    req = urllib.request.Request(f"{API}/videos/{vid}/index", data=b'', headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(f"{API}/videos/{vid}/index", data=b"", headers={"Content-Type": "application/json"})
     r = json.loads(urllib.request.urlopen(req, timeout=30).read())
     if r.get("status") != "indexing_started":
-        raise Exception(f"Expected indexing_started, got {r.get('status')}")
+        err_msg = f"Expected indexing_started, got {r.get('status')}"
+        raise Exception(err_msg)
     done = False
     while not done:
         time.sleep(1)
@@ -91,7 +97,8 @@ try:
         if stage == "done":
             done = True
         elif stage == "error":
-            raise Exception(f"Index error: {p.get('message')}")
+            err_msg = f"Index error: {p.get('message')}"
+            raise Exception(err_msg)
         else:
             sys.stdout.write(f"\r  {p.get('message', '')} ({p.get('percent', 0)}%)")
             sys.stdout.flush()
@@ -119,7 +126,7 @@ print("[6/13] Timeline...")
 try:
     r = fetch(f"{API}/videos/{vid}/timeline", timeout=10)
     check("Timeline -> video_id", r.get("video_id", ""), lambda x: len(x) >= 8)
-    check("Timeline -> fps", str(r.get("metadata", {}).get("fps", 0)), lambda x: x.replace('.', '', 1).isdigit())
+    check("Timeline -> fps", str(r.get("metadata", {}).get("fps", 0)), lambda x: x.replace(".", "", 1).isdigit())
     meta = r.get("metadata", {})
     print(f"  {meta.get('width', '?')}x{meta.get('height', '?')} at {meta.get('fps', '?')}fps, Events: {len(r.get('events', []))}")
     events = r.get("events", [])
@@ -139,9 +146,12 @@ try:
     if r.get("query_info", {}).get("search_plan"):
         plan = r["query_info"]["search_plan"]
         check("Search plan -> objects", str(len(plan.get("objects", []))), lambda x: x.isdigit())
-        if plan.get("objects"): print(f"  Objects: {', '.join(plan['objects'])}")
-        if plan.get("actions"): print(f"  Actions: {', '.join(plan['actions'])}")
-        if plan.get("location"): print(f"  Location: {plan['location']}")
+        if plan.get("objects"):
+            print(f"  Objects: {', '.join(plan['objects'])}")
+        if plan.get("actions"):
+            print(f"  Actions: {', '.join(plan['actions'])}")
+        if plan.get("location"):
+            print(f"  Location: {plan['location']}")
     segments = r.get("segments", [])
     if segments:
         s = segments[0]
@@ -151,8 +161,8 @@ try:
             print(f"  Frames: {frames[0]} .. {frames[-1]}")
         sb = s.get("score_breakdown")
         if sb:
-            check("Breakdown -> weighted_total", str(sb.get("weighted_total", 0)), lambda x: x.replace('.', '', 1).isdigit())
-            print(f"  Signals:")
+            check("Breakdown -> weighted_total", str(sb.get("weighted_total", 0)), lambda x: x.replace(".", "", 1).isdigit())
+            print("  Signals:")
             for key in ("clip_semantic", "caption_similarity", "object_match", "motion_activity", "tracking_consistency", "temporal_alignment", "relationship_overlap"):
                 print(f"    {key:25s} {sb.get(key, 0)}")
         if s.get("annotated_thumbnail"):

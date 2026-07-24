@@ -1,8 +1,9 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, lazy, Suspense } from "react";
 import SearchPage from "./components/SearchPage";
-import DashboardTab from "./components/DashboardTab";
-import TimelineTab from "./components/TimelineTab";
 import { useUpload, useSearch } from "./hooks/useApi";
+
+const DashboardTab = lazy(() => import("./components/DashboardTab"));
+const TimelineTab = lazy(() => import("./components/TimelineTab"));
 
 function cls(...args) { return args.filter(Boolean).join(" "); }
 
@@ -86,8 +87,9 @@ export default function App() {
             onUploadDone={onUploadDone}
           />
         )}
-        {tab === "dashboard" && <DashboardTab dashboardData={dashboardData} fetchDashboard={fetchDashboard} />}
+        {tab === "dashboard" && <Suspense fallback={<div className="text-gray-500 text-center py-8">Loading...</div>}><DashboardTab dashboardData={dashboardData} fetchDashboard={fetchDashboard} /></Suspense>}
         {tab === "timeline" && (
+          <Suspense fallback={<div className="text-gray-500 text-center py-8">Loading...</div>}>
           <TimelineTab
             indexedVideos={indexedVideos}
             timelineData={timelineData}
@@ -95,6 +97,7 @@ export default function App() {
             fetchTimeline={fetchTimeline}
             setSelectedTimelineVideo={setSelectedTimelineVideo}
           />
+          </Suspense>
         )}
       </main>
     </div>

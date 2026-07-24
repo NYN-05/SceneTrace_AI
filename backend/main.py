@@ -1,25 +1,35 @@
 import asyncio
+import contextlib
 import json
-import uuid
-import time
-import cv2
 import logging
 import threading
-from pathlib import Path
-from contextlib import asynccontextmanager
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, status
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import cv2
+from config import benchmark, logger, settings
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
+from pipeline import (
+    STORAGE,
+    VideoIndex,
+    device,
+    extract_clip,
+    frames_to_segments,
+    index_video,
+    parse_query,
+    search_embeddings,
+)
 from pydantic import BaseModel, Field
-from pipeline import (STORAGE, VideoIndex, search_embeddings,
-                      frames_to_segments, parse_query, index_video, extract_clip, device)
-from search_engine import search as enhanced_search, suggest as query_suggest
-from config import benchmark
-from config import settings, logger
+from search_engine import search as enhanced_search
+from search_engine import suggest as query_suggest
 
 access_logger = logging.getLogger("scenetrace.access")
 access_logger.setLevel(logging.INFO)
@@ -30,15 +40,17 @@ for h in logging.getLogger().handlers:
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
 
-executor = ThreadPoolExecutor(settings.NUM_WORKERS)
+_index_executor = ThreadPoolExecutor(max_workers=2)
+_search_executor = ThreadPoolExecutor(max_workers=settings.NUM_WORKERS * 2)
 _indexes: dict[str, VideoIndex] = {}
 _index_progress: dict[str, dict] = {}
 _indexes_lock = threading.Lock()
 _index_progress_lock = threading.Lock()
+_index_semaphore = threading.Semaphore(2)
 
 api_key_header = APIKeyHeader(name=settings.API_KEY_NAME, auto_error=False)
 
-def authenticate(request: Request, api_key: str = Depends(api_key_header)):
+def authenticate(_request: Request, api_key: str = Depends(api_key_header)):
     if not settings.API_KEY:
         return True
     if not api_key or api_key != settings.API_KEY:
@@ -84,7 +96,7 @@ def _load_persisted_indexes():
                 _indexes[vi.video_id] = vi
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     _load_persisted_indexes()
     if _indexes:
         logger.info("Reloaded %d indexes from disk (FAISS indexes loaded on demand)", len(_indexes))
@@ -162,7 +174,7 @@ async def upload_video(file: UploadFile = File(...), _=Depends(authenticate)):
     video_id = str(uuid.uuid4())[:8]
     dest = STORAGE / "originals" / f"{video_id}{ext}"
     size = 0
-    with open(dest, "wb") as buffer:
+    with dest.open("wb") as buffer:
         while chunk := await file.read(1024 * 1024):
             size += len(chunk)
             if size > MAX_UPLOAD_BYTES:
@@ -197,7 +209,13 @@ async def start_index(video_id: str, _=Depends(authenticate)):
         _index_progress[video_id] = {"stage": "starting", "percent": 0, "message": "Queued...", "_t0": time.time()}
 
     def _do_index():
-        import traceback
+        acquired = _index_semaphore.acquire(blocking=False)
+        if not acquired:
+            with _index_progress_lock:
+                if video_id in _index_progress:
+                    _index_progress[video_id].update({"stage": "error", "message": "Too many concurrent indexes. Try again later."})
+            logger.warning("Indexing concurrency limit reached for %s", video_id)
+            return
         try:
             with _index_progress_lock:
                 prog = _index_progress.get(video_id, {"_t0": time.time()})
@@ -210,9 +228,11 @@ async def start_index(video_id: str, _=Depends(authenticate)):
             logger.exception("Indexing failed for %s", video_id)
             with _index_progress_lock:
                 if video_id in _index_progress:
-                    _index_progress[video_id].update({"stage": "error", "message": f"Failed: {str(e)}"})
+                    _index_progress[video_id].update({"stage": "error", "message": f"Failed: {e!s}"})
+        finally:
+            _index_semaphore.release()
 
-    executor.submit(_do_index)
+    _index_executor.submit(_do_index)
     return {"video_id": video_id, "status": "indexing_started"}
 
 @app.get("/api/videos/{video_id}/index-progress")
@@ -236,6 +256,7 @@ def get_index_progress(video_id: str):
 async def index_progress_stream(video_id: str):
     async def event_generator():
         last = None
+        last_send = time.time()
         while True:
             with _index_progress_lock:
                 p = _index_progress.get(video_id)
@@ -249,9 +270,14 @@ async def index_progress_stream(video_id: str):
                 continue
             resp = dict(p)
             resp.pop("_t0", None)
+            now = time.time()
             if resp != last:
                 yield f"data: {json.dumps(resp)}\n\n"
                 last = resp
+                last_send = now
+            elif now - last_send > 15:
+                yield ": heartbeat\n\n"
+                last_send = now
             if p.get("stage") in ("done", "error"):
                 return
             await asyncio.sleep(0.5)
@@ -279,7 +305,7 @@ async def _run_search_with_timeout(req: SearchRequest):
             return []
         faiss_idx = idx.get_faiss_index()
         loop = asyncio.get_event_loop()
-        indices, scores = await loop.run_in_executor(executor, search_embeddings, req.query, faiss_idx, embs, req.top_k * 2)
+        indices, scores = await loop.run_in_executor(_search_executor, search_embeddings, req.query, faiss_idx, embs, req.top_k * 2)
         segs = frames_to_segments(indices, scores)
         for seg in segs:
             orig = seg["frame_indices"]
@@ -297,7 +323,7 @@ async def _run_search_with_timeout(req: SearchRequest):
     top_score = results[0]["avg_score"] if results else 0
     status_val = "high" if top_score > settings.SEARCH_HIGH_THRESHOLD else ("medium" if top_score > settings.SEARCH_MEDIUM_THRESHOLD else "low")
     with _indexes_lock:
-        first_id = list(_indexes.keys())[0] if _indexes else ""
+        first_id = next(iter(_indexes.keys())) if _indexes else ""
     return {"video_id": first_id, "segments": results, "query_info": parse_query(req.query), "status": status_val}
 
 @app.post("/api/search")
@@ -305,7 +331,7 @@ async def search(req: SearchRequest, _=Depends(authenticate)):
     try:
         return await asyncio.wait_for(_run_search_with_timeout(req), timeout=settings.REQUEST_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        raise HTTPException(504, "Search request timed out")
+        raise HTTPException(504, "Search request timed out") from None
 
 @app.get("/api/clips/{video_id}")
 def get_clip(video_id: str, start_frame: int, end_frame: int, _=Depends(authenticate)):
@@ -358,17 +384,16 @@ async def _run_search_v2_with_timeout(req: V2SearchRequest):
     if not targets:
         return JSONResponse(status_code=400, content={"detail": "No videos indexed." if not req.video_id else f"Video {req.video_id} not found.", "segments": []})
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        executor, enhanced_search, req.query, targets, req.top_k, req.enable_detection
+    return await loop.run_in_executor(
+        _search_executor, enhanced_search, req.query, targets, req.top_k, req.enable_detection,
     )
-    return result
 
 @app.post("/api/v2/search")
 async def search_v2(req: V2SearchRequest, _=Depends(authenticate)):
     try:
         return await asyncio.wait_for(_run_search_v2_with_timeout(req), timeout=settings.REQUEST_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        raise HTTPException(504, "Search request timed out")
+        raise HTTPException(504, "Search request timed out") from None
 
 @app.get("/api/videos/{video_id}/timeline")
 def get_timeline(video_id: str):
@@ -377,18 +402,18 @@ def get_timeline(video_id: str):
     if not idx:
         raise HTTPException(404, "Video not indexed")
     events = []
-    for i, (fi, ts, ms) in enumerate(zip(idx.frame_indices, idx.timestamps, idx.motion_scores)):
+    for _i, (fi, ts, ms) in enumerate(zip(idx.frame_indices, idx.timestamps, idx.motion_scores)):
         events.append({
             "frame_index": fi,
             "timestamp": round(ts, 2),
             "motion_score": round(ms, 4),
-            "has_thumbnail": (STORAGE / "frames" / video_id / f"frame_{fi}.jpg").exists()
+            "has_thumbnail": (STORAGE / "frames" / video_id / f"frame_{fi}.jpg").exists(),
         })
     return {
         "video_id": video_id,
         "metadata": idx.metadata,
         "total_keyframes": len(idx.frame_indices),
-        "events": events
+        "events": events,
     }
 
 @app.get("/api/videos/{video_id}/objects")
@@ -403,14 +428,12 @@ def get_video_objects(video_id: str):
         annotated_path = vf / f"frame_{fi}_d.jpg"
         if annotated_path.exists():
             ts = 0.0
-            try:
+            with contextlib.suppress(ValueError):
                 ts = idx.timestamps[idx.frame_indices.index(fi)]
-            except ValueError:
-                pass
             detected.append({
                 "frame_index": fi,
                 "timestamp": round(ts, 2),
-                "annotated": f"/api/frames/{video_id}/frame_{fi}_d.jpg"
+                "annotated": f"/api/frames/{video_id}/frame_{fi}_d.jpg",
             })
     return {"video_id": video_id, "detected_frames": detected}
 
@@ -431,13 +454,13 @@ def search_suggest(req: SearchRequest):
 
 @app.post("/api/storage/cleanup")
 def cleanup_storage(_=Depends(authenticate)):
-    cutoff = datetime.now() - timedelta(days=settings.STORAGE_CLEANUP_DAYS)
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=settings.STORAGE_CLEANUP_DAYS)
     cleaned = {"clips": 0, "reports": 0, "originals": 0}
     for dir_name, target_dir in [("clips", STORAGE / "clips"), ("reports", STORAGE / "reports"), ("originals", STORAGE / "originals")]:
         if target_dir.exists():
             for item in target_dir.iterdir():
                 if item.is_file():
-                    mtime = datetime.fromtimestamp(item.stat().st_mtime)
+                    mtime = datetime.fromtimestamp(item.stat().st_mtime, tz=timezone.utc)
                     if mtime < cutoff:
                         item.unlink()
                         cleaned[dir_name] += 1

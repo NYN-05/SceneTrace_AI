@@ -1,7 +1,10 @@
-import os
 import logging
 import logging.handlers
+import os
+import threading
+import time
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 _env_path = Path(__file__).parent / ".env"
@@ -106,8 +109,6 @@ if not _root_logger.handlers:
 logger = logging.getLogger("scenetrace")
 
 # ---- Thread-safe performance benchmark ----
-import threading
-import time
 
 class BenchmarkStats:
     _instance = None

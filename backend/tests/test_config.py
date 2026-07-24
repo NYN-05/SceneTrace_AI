@@ -1,10 +1,10 @@
 import sys
-import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import settings, PROJECT_ROOT
+from config import PROJECT_ROOT, settings
+
 
 def test_defaults():
     assert settings.CORS_ORIGINS == "http://localhost:5173"
@@ -26,9 +26,9 @@ def test_defaults():
 
     expected_root = Path(__file__).parent.parent.parent.resolve()
 
-    assert PROJECT_ROOT == expected_root
+    assert expected_root == PROJECT_ROOT
 
-    assert settings.LOG_FILE == str(expected_root / "server.log")
+    assert str(expected_root / "server.log") == settings.LOG_FILE
 
     assert settings.CLIP_WEIGHT == 0.20
     assert settings.CAPTION_WEIGHT == 0.20
@@ -65,6 +65,7 @@ def test_env_override(monkeypatch):
     monkeypatch.setenv("CLIP_MODEL_NAME", "openai/clip-vit-large-patch14")
     monkeypatch.setenv("DET_CACHE_MAXSIZE", "1000")
     import importlib
+
     import config
     importlib.reload(config)
     assert config.settings.CORS_ORIGINS == "http://example.com"

@@ -1,4 +1,5 @@
 import cv2
+import math
 import numpy as np
 import torch
 from pathlib import Path
@@ -182,7 +183,7 @@ def _get_clip():
         with _clip_lock:
             if _clip_model is None:
                 logger.info("Loading CLIP model on %s...", device)
-                _clip_model = CLIPModel.from_pretrained(settings.CLIP_MODEL_NAME).eval().to(device)
+                _clip_model = CLIPModel.from_pretrained(settings.CLIP_MODEL_NAME, torch_dtype=torch.float32).eval().to(device)
                 _clip_processor = CLIPProcessor.from_pretrained(settings.CLIP_MODEL_NAME)
                 logger.info("CLIP model loaded")
     return _clip_model, _clip_processor
@@ -204,18 +205,24 @@ def compute_embeddings(imgs: list[np.ndarray], batch_size: int = 0,
         batch = imgs[i:i+bs]
         if preproc_future is not None:
             inputs = preproc_future.result().to(device)
+            preproc_future = None
         else:
             rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch]
             inputs = processor(images=rgb, return_tensors="pt", padding=True).to(device)
         next_i = i + bs
+        submitted = None
         if next_i < len(imgs):
             next_batch = imgs[next_i:next_i+bs]
-            preproc_future = pool.submit(_preprocess_batch, next_batch, processor)
-        else:
-            preproc_future = None
-        emb = model.get_image_features(**inputs)
-        emb_norm = emb / emb.norm(dim=-1, keepdim=True)
-        all_embs.append(emb_norm.cpu().numpy())
+            submitted = pool.submit(_preprocess_batch, next_batch, processor)
+        try:
+            emb = model.get_image_features(**inputs)
+            emb_norm = emb / emb.norm(dim=-1, keepdim=True)
+            all_embs.append(emb_norm.cpu().numpy())
+        except Exception:
+            if submitted is not None:
+                submitted.result()
+            raise
+        preproc_future = submitted
         if progress is not None:
             batch_idx = i // bs + 1
             pct = min(99, 25 + int(60 * batch_idx / n_batches))
@@ -255,9 +262,11 @@ def _encode_clip_light(frame_embeddings: np.ndarray, motion_scores: list[float])
     from motion sampling. No optical flow needed.
     """
     avg_emb = np.mean(frame_embeddings, axis=0)
+    avg_emb = np.nan_to_num(avg_emb, nan=0.0, posinf=1.0, neginf=0.0)
     ms = np.array(motion_scores, dtype="float32")
-    mw = settings.CLIP_MOTION_WEIGHT
+    mw = max(0.0, min(1.0, settings.CLIP_MOTION_WEIGHT))
     motion_feat = np.array([float(np.mean(ms)), float(np.std(ms)), float(np.max(ms))], dtype="float32")
+    motion_feat = np.nan_to_num(motion_feat, nan=0.0, posinf=1.0, neginf=0.0)
     clip_vec = np.concatenate([avg_emb * (1 - mw), motion_feat * mw])
     norm = np.linalg.norm(clip_vec)
     if norm > 0:
@@ -497,6 +506,9 @@ def motion_sample(video_path: str, stride: int = 0, target_pct: float = 0,
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if method not in ("diff", "farneback"):
+        logger.warning("Unknown motion method '%s', falling back to 'diff'", method)
+        method = "diff"
     score_fn = _motion_score_farneback if method == "farneback" else _motion_score_diff
     stride = stride or settings.MOTION_STRIDE
     target_pct = target_pct or settings.MOTION_TARGET_PCT
@@ -593,7 +605,16 @@ def search_embeddings(query: str, index: faiss.Index | None, embeddings: np.ndar
     if index is None:
         index = build_faiss_index(embeddings)
     scores, indices = index.search(q_emb, min(top_k, n))
-    return indices[0].tolist(), scores[0].tolist()
+    idx_list = indices[0].tolist()
+    good_idx = []
+    sc_list = []
+    for idx, sc in zip(idx_list, scores[0].tolist()):
+        if idx < 0:
+            continue
+        s = max(0.0, min(1.0, sc)) if math.isfinite(sc) else 0.0
+        good_idx.append(idx)
+        sc_list.append(s)
+    return good_idx, sc_list
 
 def frames_to_segments(indices: list[int], scores: list[float], gap_thresh: int = 0) -> list[dict]:
     if not indices:
@@ -620,10 +641,11 @@ def extract_clip(video_path: str, start_time: float, end_time: float, output: st
     fps = cap.get(cv2.CAP_PROP_FPS)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * fps))
-    end = int(end_time * fps)
-    cur = int(start_time * fps)
-    while cur < end:
+    start_frame = int(round(start_time * fps))
+    end_frame = int(round(end_time * fps))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    cur = start_frame
+    while cur < end_frame:
         ret, frame = cap.read()
         if not ret:
             break
@@ -652,7 +674,8 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
         logger.info("Enforcing min FPS: adding %d uniform frames to meet INDEX_MIN_FPS=%d",
                     min_keyframes - len(keep_frames), settings.INDEX_MIN_FPS)
         existing = set(keep_frames)
-        uniform = [int(f) for f in np.linspace(0, total - 1, min_keyframes, dtype=int) if f not in existing]
+        max_valid = max(total - 1, 0)
+        uniform = [int(f) for f in np.linspace(0, max_valid, min_keyframes, dtype=int) if f not in existing and 0 <= f <= max_valid]
         uniform = uniform[:min_keyframes - len(keep_frames)]
         for f in uniform:
             keep_frames.append(f)
@@ -701,7 +724,8 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     for win_frame_idxs, clip_emb in results:
         clip_indices.append(win_frame_idxs)
         clip_embs_list.append(clip_emb)
-    clip_embeddings_arr = np.array(clip_embs_list, dtype="float32") if clip_embs_list else np.empty((0, 515), dtype="float32")
+    _clip_dim = _encode_clip_light(np.zeros((1, embs.shape[1]), dtype="float32"), [0.0]).shape[0] if len(embs) > 0 else embs.shape[1] + 3
+    clip_embeddings_arr = np.array(clip_embs_list, dtype="float32") if clip_embs_list else np.empty((0, _clip_dim), dtype="float32")
     t_clip = time.time()
     if len(clip_embeddings_arr) > 0:
         logger.info("Clip embeddings: %d clips from %d frames in %.1fs",
@@ -847,13 +871,7 @@ def index_video(video_path: str, video_id: str, progress: dict = None) -> VideoI
     if caption_embs is not None and len(caption_embs) > 0:
         faiss_tasks.append(("caption", lambda: (build_faiss_index(caption_embs), idx.save_caption_faiss_index, idx.save_caption_embeddings)))
 
-    def _build_one(name: str, fn: callable):
-        index, save_index, save_embs = fn()
-        save_index(index)
-        save_embs(None if name == "main" else (object_embs if name == "object" else caption_embs))
-        return name
-
-    # Actually, let me do a simpler pattern: build indexes in parallel, save sequentially after
+    # Build indexes in parallel, save sequentially after
     def _build_main():
         fi = build_faiss_index(embs)
         idx.save_faiss_index(fi)

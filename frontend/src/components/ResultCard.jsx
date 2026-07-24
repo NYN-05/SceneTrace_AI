@@ -19,8 +19,10 @@ export default function ResultCard({ seg, index }) {
   const endTs = seg.timestamps?.[seg.timestamps.length - 1];
   const duration = startTs != null && endTs != null ? (endTs - startTs).toFixed(1) : null;
 
-  const copyTs = () => {
-    if (startTs != null) navigator.clipboard.writeText(`${startTs.toFixed(1)}s`);
+  const copyTs = async () => {
+    if (startTs != null) {
+      try { await navigator.clipboard.writeText(`${startTs.toFixed(1)}s`); } catch {}
+    }
   };
 
   return (
@@ -47,7 +49,7 @@ export default function ResultCard({ seg, index }) {
             <span className="text-xs text-cyan-400 font-medium">{pct}% match</span>
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-500 mb-2">
-            <span>⏱ {startTs?.toFixed(1) || "?"}s{duration ? ` – ${(parseFloat(startTs) + parseFloat(duration)).toFixed(1)}s` : ""}</span>
+            <span>⏱ {startTs?.toFixed(1) || "?"}s{duration ? ` – ${(startTs + Number(duration)).toFixed(1)}s` : ""}</span>
             {duration && <span>📐 {duration}s duration</span>}
             <span>📄 Frames {seg.frame_indices?.[0]}–{seg.frame_indices?.[seg.frame_indices.length - 1]}</span>
           </div>
@@ -71,10 +73,10 @@ export default function ResultCard({ seg, index }) {
             <div className="mt-2 text-[11px] text-gray-500 bg-gray-800 rounded p-2">
               <p className="text-gray-400 font-medium mb-1">Why this matched:</p>
               <ul className="space-y-0.5">
-                {seg.score_breakdown?.semantic_similarity > 0.1 && <li>✔ Semantic meaning matches your query</li>}
+                {seg.score_breakdown?.clip_semantic > 0.1 && <li>✔ Semantic meaning matches your query</li>}
                 {seg.detections?.length > 0 && <li>✔ Detected: {seg.detections.map(d => d.label).join(", ")}</li>}
                 {seg.score_breakdown?.tracking_consistency > 0 && <li>✔ Object tracked consistently</li>}
-                {seg.score_breakdown?.temporal_match > 0 && <li>✔ Inside requested time range</li>}
+                {seg.score_breakdown?.temporal_alignment > 0 && <li>✔ Inside requested time range</li>}
                 {seg.score_breakdown?.motion_activity > 0 && <li>✔ Motion activity detected</li>}
               </ul>
             </div>

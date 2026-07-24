@@ -43,9 +43,9 @@ export default function App() {
   useEffect(() => { fetchIndexedVideos(); }, [fetchIndexedVideos]);
 
   const tabs = [
-    { key: "search", label: "🔍 Search" },
-    { key: "dashboard", label: "📊 Dashboard" },
-    { key: "timeline", label: "⏳ Timeline" },
+    { key: "search", label: "Search" },
+    { key: "dashboard", label: "Dashboard" },
+    { key: "timeline", label: "Timeline" },
   ];
 
   const onUploadDone = useCallback(() => {

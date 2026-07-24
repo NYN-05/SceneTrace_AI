@@ -15,9 +15,6 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from pipeline import (STORAGE, VideoIndex, search_embeddings,
                       frames_to_segments, parse_query, index_video, extract_clip, device)
 from search_engine import search as enhanced_search, suggest as query_suggest
@@ -26,6 +23,7 @@ from config import settings, logger
 
 access_logger = logging.getLogger("scenetrace.access")
 access_logger.setLevel(logging.INFO)
+access_logger.propagate = False
 for h in logging.getLogger().handlers:
     access_logger.addHandler(h)
 
@@ -39,8 +37,6 @@ _indexes_lock = threading.Lock()
 _index_progress_lock = threading.Lock()
 
 api_key_header = APIKeyHeader(name=settings.API_KEY_NAME, auto_error=False)
-
-limiter = Limiter(key_func=get_remote_address)
 
 def authenticate(request: Request, api_key: str = Depends(api_key_header)):
     if not settings.API_KEY:
@@ -95,9 +91,6 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="SceneTrace AI", lifespan=lifespan)
-
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -328,8 +321,11 @@ def get_clip(video_id: str, start_frame: int, end_frame: int, _=Depends(authenti
     cap = cv2.VideoCapture(str(candidates[0]))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    start_idx = idx.frame_indices.index(start_frame) if start_frame in idx.frame_indices else -1
-    end_idx = idx.frame_indices.index(end_frame) if end_frame in idx.frame_indices else -1
+    try:
+        start_idx = idx.frame_indices.index(start_frame) if start_frame in idx.frame_indices else -1
+        end_idx = idx.frame_indices.index(end_frame) if end_frame in idx.frame_indices else -1
+    except ValueError:
+        start_idx = end_idx = -1
     start_time = idx.timestamps[start_idx] if start_idx >= 0 else start_frame / max(fps, 1)
     end_time = idx.timestamps[end_idx] if end_idx >= 0 else end_frame / max(fps, 1)
     extract_clip(str(candidates[0]), start_time, end_time, str(output))
@@ -406,9 +402,14 @@ def get_video_objects(video_id: str):
     for fi in idx.frame_indices[:50]:
         annotated_path = vf / f"frame_{fi}_d.jpg"
         if annotated_path.exists():
+            ts = 0.0
+            try:
+                ts = idx.timestamps[idx.frame_indices.index(fi)]
+            except ValueError:
+                pass
             detected.append({
                 "frame_index": fi,
-                "timestamp": round(idx.timestamps[idx.frame_indices.index(fi)], 2) if fi in idx.frame_indices else 0,
+                "timestamp": round(ts, 2),
                 "annotated": f"/api/frames/{video_id}/frame_{fi}_d.jpg"
             })
     return {"video_id": video_id, "detected_frames": detected}

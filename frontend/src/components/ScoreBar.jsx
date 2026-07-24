@@ -1,10 +1,10 @@
 export default function ScoreBar({ breakdown }) {
   if (!breakdown) return null;
   const items = [
-    { label: "Semantic", key: "semantic_similarity", color: "#06b6d4" },
+    { label: "Semantic", key: "clip_semantic", color: "#06b6d4" },
     { label: "Object Match", key: "object_match", color: "#22d3ee" },
     { label: "Tracking", key: "tracking_consistency", color: "#10b981" },
-    { label: "Temporal", key: "temporal_match", color: "#f59e0b" },
+    { label: "Temporal", key: "temporal_alignment", color: "#f59e0b" },
     { label: "Motion", key: "motion_activity", color: "#8b5cf6" },
   ].filter(i => (breakdown[i.key] || 0) > 0);
   if (!items.length) return null;

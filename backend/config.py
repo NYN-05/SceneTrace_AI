@@ -4,7 +4,8 @@ import logging.handlers
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+_env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -67,7 +68,7 @@ class Settings:
 
     # ---- Phase 3: Scene captioning & query parsing ----
     CAPTIONER_MODEL: str = os.getenv("CAPTIONER_MODEL", "microsoft/Florence-2-base")
-    CAPTIONER_ENABLED: bool = os.getenv("CAPTIONER_ENABLED", "").lower() in ("1", "true", "yes")
+    CAPTIONER_ENABLED: bool = os.getenv("CAPTIONER_ENABLED", "false").lower() in ("1", "true", "yes")
     QUERY_PARSER_MODE: str = os.getenv("QUERY_PARSER_MODE", "regex")
 
     # ---- Phase 4: Clip-level indexing & temporal reasoning ----
@@ -89,17 +90,18 @@ settings = Settings()
 _root_logger = logging.getLogger()
 _root_logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+if not _root_logger.handlers:
+    _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-_console = logging.StreamHandler()
-_console.setFormatter(_fmt)
-_root_logger.addHandler(_console)
+    _console = logging.StreamHandler()
+    _console.setFormatter(_fmt)
+    _root_logger.addHandler(_console)
 
-_log_path = Path(settings.LOG_FILE)
-_log_path.parent.mkdir(parents=True, exist_ok=True)
-_file = logging.handlers.RotatingFileHandler(str(_log_path), maxBytes=10*1024*1024, backupCount=3, encoding="utf-8")
-_file.setFormatter(_fmt)
-_root_logger.addHandler(_file)
+    _log_path = Path(settings.LOG_FILE)
+    _log_path.parent.mkdir(parents=True, exist_ok=True)
+    _file = logging.handlers.RotatingFileHandler(str(_log_path), maxBytes=10*1024*1024, backupCount=3, encoding="utf-8")
+    _file.setFormatter(_fmt)
+    _root_logger.addHandler(_file)
 
 logger = logging.getLogger("scenetrace")
 

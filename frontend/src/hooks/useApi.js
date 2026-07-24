@@ -11,6 +11,12 @@ export function useUpload() {
   const pollingRef = useRef(null);
   const fileRef = useRef(null);
 
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+    };
+  }, []);
+
   const log = useCallback((msg) => setLogs((p) => [...p, msg]), []);
 
   const stopPolling = useCallback(() => {

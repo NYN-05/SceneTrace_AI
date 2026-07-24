@@ -6,6 +6,7 @@ Multi-stage pipeline (Phase 5):
   Stage 3 — 6-signal hybrid scoring with configurable weights
   Stage 4 — Cross-encoder reranker (optional)
 """
+import math
 import re
 import time
 import cv2
@@ -255,14 +256,25 @@ def _search_objects_faiss(query: str, vid: str, idx,
     if obj_faiss is None or obj_embs is None or len(obj_embs) == 0:
         return {}, {}
     if len(idx.object_metadata) != len(obj_embs):
-        return {}, {}
+        logger.warning("object_metadata (%d) vs obj_embs (%d) mismatch for %s; using min",
+                       len(idx.object_metadata), len(obj_embs), vid)
+        n_meta = min(len(idx.object_metadata), len(obj_embs))
+        obj_meta = idx.object_metadata[:n_meta]
+        obj_embs = obj_embs[:n_meta]
+    else:
+        obj_meta = idx.object_metadata
     q_emb = embed_text([query])
     n = len(obj_embs)
     scores, indices = obj_faiss.search(q_emb, min(top_k * 3, n))
     frame_map: dict[int, list[dict]] = {}
     track_hits: dict[int, list[float]] = {}
     for obj_idx, score in zip(indices[0], scores[0]):
-        meta = idx.object_metadata[obj_idx]
+        if obj_idx < 0 or obj_idx >= len(obj_meta):
+            continue
+        s_val = float(score)
+        if not math.isfinite(s_val):
+            s_val = 0.0
+        meta = obj_meta[obj_idx]
         fi = meta["frame_idx"]
         if sqlite_frame_set is not None and fi not in sqlite_frame_set:
             continue
@@ -271,7 +283,7 @@ def _search_objects_faiss(query: str, vid: str, idx,
             "bbox": meta["bbox"],
             "label": meta["label"],
             "score": meta["score"],
-            "clip_similarity": round(float(score), 3),
+            "clip_similarity": round(float(s_val), 3),
             "track_id": tid,
         }
         if fi not in frame_map:
@@ -298,6 +310,8 @@ def _search_objects_faiss(query: str, vid: str, idx,
 
 def _compute_motion_score(mid_frame: int, idx) -> float:
     """Return motion_activity score (0-1) for a keyframe, or 0 if unavailable."""
+    if not idx.frame_indices or not idx.motion_scores:
+        return 0.0
     try:
         pos = idx.frame_indices.index(mid_frame)
         if pos < len(idx.motion_scores):
@@ -318,9 +332,15 @@ def _search_captions_faiss(query: str, idx) -> dict[int, float]:
     scores, indices = cap_faiss.search(q_emb, min(50, n))
     frame_to_sim: dict[int, float] = {}
     for pos, score in zip(indices[0], scores[0]):
-        if pos < len(idx.frame_indices):
-            fi = idx.frame_indices[pos]
-            frame_to_sim[fi] = round(float(score), 3)
+        if pos < 0 or pos >= len(idx.frame_indices):
+            continue
+        fi = idx.frame_indices[pos]
+        s = float(score)
+        if not (math.isfinite(s) and -1.0 <= s <= 1.0):
+            s = 0.0
+        s = max(0.0, s)
+        if s > 0:
+            frame_to_sim[fi] = round(float(s), 3)
     return frame_to_sim
 
 
@@ -335,13 +355,13 @@ def _search_clip_embeddings(query: str, idx) -> dict[int, float]:
     if clip_embs is None or len(clip_embs) == 0 or not idx.clip_indices:
         return {}
     q_emb = embed_text([query])
-    # clip_embs are 515-dim (512 CLIP + 3 motion); trim to 512 for text comparison
     if clip_embs.shape[1] == 515 and q_emb.shape[1] == 512:
-        clip_embs = clip_embs[:, :512]
+        clip_embs = clip_embs[:, :512].copy()
     sims = np.dot(clip_embs, q_emb.T).flatten()
+    sims = np.nan_to_num(sims, nan=0.0, posinf=1.0, neginf=0.0)
     frame_to_score: dict[int, float] = {}
     for clip_frames, sim in zip(idx.clip_indices, sims):
-        s = round(float(max(0.0, sim)), 3)
+        s = round(float(max(0.0, min(1.0, sim))), 3)
         for fi in clip_frames:
             if s > frame_to_score.get(fi, 0.0):
                 frame_to_score[fi] = s
@@ -463,7 +483,9 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
             return []
         faiss_idx = idx.get_faiss_index()
         indices, scores = search_embeddings(expanded_query, faiss_idx, embs, top_k * 3)
-        segs = frames_to_segments(indices, scores)
+        paired = sorted(zip(indices, scores), key=lambda x: idx.frame_indices[x[0]])
+        sorted_idx, sorted_sc = zip(*paired) if paired else ([], [])
+        segs = frames_to_segments(list(sorted_idx), list(sorted_sc))
         for s in segs:
             orig = s["frame_indices"]
             s["video_id"] = vid
@@ -495,14 +517,6 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
         cap_results: list[dict[int, float]] = [{} for _ in range(n_vids)]
         clip_results: list[dict[int, float]] = [{} for _ in range(n_vids)]
 
-        tasks: list[tuple[int, str, str, callable]] = []
-        for i, (vid, idx) in enumerate(vid_list):
-            tasks.append((i, vid, "sem", lambda i=i, vid=vid, idx=idx: sem_results.__setitem__(i, _search_video_semantic(vid, idx))))
-            tasks.append((i, vid, "obj", lambda i=i, vid=vid, idx=idx: (obj_maps.__setitem__(i, {}), obj_tracks.__setitem__(i, {})) or _search_video_objects(vid, idx) and None))
-            tasks.append((i, vid, "cap", lambda i=i, vid=vid, idx=idx: cap_results.__setitem__(i, _search_video_caption(vid, idx))))
-            tasks.append((i, vid, "clip", lambda i=i, vid=vid, idx=idx: clip_results.__setitem__(i, _search_video_clip(vid, idx))))
-
-        # Simpler approach: run each type in parallel with separate pools
         def _run_sem():
             for i, (vid, idx) in enumerate(vid_list):
                 sem_results[i] = _search_video_semantic(vid, idx)
@@ -567,7 +581,8 @@ def search(query: str, indexes: dict, top_k: int = 5, enable_detection: bool = T
                 for tid in tids:
                     ti = object_track_info[vid].get(tid)
                     if ti:
-                        norm = min(ti["total_frames"] / 10.0, 1.0)
+                        tf = ti.get("total_frames", 0)
+                        norm = min(tf / max(10.0, 1.0), 1.0)
                         trk_scores.append(norm * ti.get("match_score", 0))
                 seg["tracking_consistency"] = round(sum(trk_scores) / len(trk_scores), 3) if trk_scores else 0
             else:

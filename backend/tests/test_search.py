@@ -83,7 +83,8 @@ class TestExtractClassNames:
 
     def test_query_with_numbers(self):
         names = _extract_class_names("find 2 cars and 3 people")
-        assert "car" in names or "cars" in names
+        assert "car" in names
+        assert "person" not in names
 
     def test_partial_word_does_not_match(self):
         names = _extract_class_names("pers")

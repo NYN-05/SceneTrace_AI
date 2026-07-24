@@ -18,17 +18,25 @@ _processor = None
 
 # ---- YOLO-World manager ----
 _yolo_manager_lock = threading.Lock()
+_yolo_bool_lock = threading.Lock()
+
+
+_YOLO_FILE_MAP = {
+    "large": "yolov8l-world.pt",
+    "medium": "yolov8m-world.pt",
+    "small": "yolov8s-world.pt",
+}
 
 
 class YOLOWorldManager:
-    VARIANTS = OrderedDict([
-        ("large",  "yolov8l-world.pt"),
-        ("medium", "yolov8m-world.pt"),
-        ("small",  "yolov8s-world.pt"),
-    ])
+    VARIANTS = OrderedDict()
+    for _v in settings.YOLO_WORLD_FALLBACKS.split(","):
+        _v = _v.strip()
+        if _v in _YOLO_FILE_MAP:
+            VARIANTS[_v] = _YOLO_FILE_MAP[_v]
 
     def __init__(self, default_variant="large"):
-        self.default = default_variant
+        self.default = default_variant if default_variant in self.VARIANTS else next(iter(self.VARIANTS))
         self._models = {}
         self._current = None
         self._load_lock = threading.Lock()
@@ -62,18 +70,28 @@ class YOLOWorldManager:
         start = names.index(self.default)
         ordered = names[start:] + names[:start]
         seen = set()
-        chain = [v for v in ordered if v not in seen and not seen.add(v)]
+        chain = [v for v in ordered if not (v in seen or seen.add(v))]
 
         last_error = None
         for name in chain:
             try:
                 model = self.get(name)
-                model.model.conf = threshold or settings.DETECTION_THRESHOLD
+                model.model.conf = float(threshold or settings.DETECTION_THRESHOLD)
 
                 texts = [t.strip() for t in text.split(",") if t.strip()]
                 model.set_classes(texts)
 
-                results = model(image, verbose=False)
+                with _yolo_bool_lock:
+                    orig_bool = torch.Tensor.__bool__
+                    def _safe_bool(self):
+                        if self.numel() != 1:
+                            return self.numel() > 0
+                        return orig_bool(self)
+                    torch.Tensor.__bool__ = _safe_bool
+                    try:
+                        results = model(image, verbose=False)
+                    finally:
+                        torch.Tensor.__bool__ = orig_bool
                 r = results[0]
 
                 h, w = image.shape[:2]
@@ -103,7 +121,10 @@ class YOLOWorldManager:
 def _reload_model_weights(model, variant_name: str, target_device: str):
     import ultralytics.utils.downloads
     ckpt_path = ultralytics.utils.downloads.attempt_download_asset(variant_name)
-    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    except Exception:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     model.to_empty(device=target_device)
     raw = ckpt.get("model", ckpt)
     if isinstance(raw, dict):
